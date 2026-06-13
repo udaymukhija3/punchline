@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: punchline-demo
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /readyz
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: STATIC_DIR
+        value: /app/web
+      - key: ROOM_IDLE_TTL
+        value: 20m
+      - key: MAX_LOCAL_ROOMS
+        value: 100
