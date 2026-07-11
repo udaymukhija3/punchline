@@ -392,7 +392,11 @@ func (h *Handler) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+		// 'self' does not cover ws:/wss: in every engine, so the WebSocket
+		// origin is pinned to this request's host rather than allowing every
+		// ws: destination.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://"+r.Host+" wss://"+r.Host+"; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 		if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}

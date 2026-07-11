@@ -176,6 +176,13 @@ func TestSecurityHeadersAndSameOriginCORS(t *testing.T) {
 			t.Fatalf("missing security header %s", name)
 		}
 	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self' ws://punchline.example wss://punchline.example;") {
+		t.Fatalf("CSP connect-src is not pinned to the request host: %q", csp)
+	}
+	if strings.Contains(csp, "ws: ") || strings.Contains(csp, " wss:;") {
+		t.Fatalf("CSP connect-src allows arbitrary websocket hosts: %q", csp)
+	}
 }
 
 func TestLoopbackDevOriginIsAllowedAcrossPorts(t *testing.T) {
