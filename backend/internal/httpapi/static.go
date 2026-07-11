@@ -32,10 +32,16 @@ func spaHandler(dir string) http.Handler {
 		}
 		if f, err := root.Open(path.Clean(upath)); err == nil {
 			_ = f.Close()
+			if strings.HasPrefix(upath, "/assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			fs.ServeHTTP(w, r)
 			return
 		}
 		// Missing file -> serve the SPA shell.
+		w.Header().Set("Cache-Control", "no-cache")
 		r = r.Clone(r.Context())
 		r.URL.Path = "/"
 		fs.ServeHTTP(w, r)

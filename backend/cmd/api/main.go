@@ -24,9 +24,15 @@ func main() {
 
 	port := getenv("PORT", "8080")
 	instanceID := instanceID()
-	roomLeaseTTL := getenvDuration("ROOM_LEASE_TTL", 6*time.Hour)
+	roomLeaseTTL := getenvDuration("ROOM_LEASE_TTL", 90*time.Second)
 	roomIdleTTL := getenvDuration("ROOM_IDLE_TTL", 30*time.Minute)
+	heartbeatInterval := getenvDuration("ROOM_HEARTBEAT_INTERVAL", 15*time.Second)
+	shutdownDrainGrace := getenvDuration("SHUTDOWN_DRAIN_GRACE", 5*time.Second)
 	maxLocalRooms := getenvInt("MAX_LOCAL_ROOMS", 5000)
+	if heartbeatInterval >= roomLeaseTTL {
+		heartbeatInterval = roomLeaseTTL / 3
+		log.Printf("ROOM_HEARTBEAT_INTERVAL must be below ROOM_LEASE_TTL; using %s", heartbeatInterval)
+	}
 
 	deckPath, err := cards.FindSeedDeckPath()
 	if err != nil {
@@ -36,18 +42,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("load seed deck %s: %v", deckPath, err)
 	}
-	registry, cleanup := roomRegistry()
+	registry, stateStore, cleanup := roomRegistry()
 	defer cleanup()
 
 	manager := realtime.NewRoomManager(
 		deck,
 		realtime.WithInstanceID(instanceID),
 		realtime.WithRoomRegistry(registry),
+		realtime.WithRoomStateStore(stateStore),
 		realtime.WithRoomLeaseTTL(roomLeaseTTL),
 		realtime.WithRoomIdleTTL(roomIdleTTL),
 		realtime.WithMaxLocalRooms(maxLocalRooms),
 	)
-	manager.StartHeartbeat(ctx, time.Minute)
+	stateCtx, stopStatePersistence := context.WithCancel(context.Background())
+	defer stopStatePersistence()
+	manager.StartStatePersistence(stateCtx)
+	manager.StartHeartbeat(ctx, heartbeatInterval)
 	manager.StartJanitor(ctx, time.Minute)
 	handler := httpapi.NewHandler(manager)
 
@@ -69,7 +79,13 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	manager.StartDraining()
 	log.Println("shutdown signal received; draining connections")
+	if shutdownDrainGrace > 0 {
+		time.Sleep(shutdownDrainGrace)
+	}
+	manager.Shutdown()
+	stopStatePersistence()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -122,10 +138,13 @@ func instanceID() string {
 	return "local"
 }
 
-func roomRegistry() (realtime.RoomRegistry, func()) {
-	databaseURL := os.Getenv("DATABASE_URL")
+func roomRegistry() (realtime.RoomRegistry, realtime.RoomStateStore, func()) {
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if databaseURL == "" {
-		return realtime.NewMemoryRoomRegistry(), func() {}
+		if truthy(os.Getenv("PUNCHLINE_REQUIRE_DATABASE")) {
+			log.Fatal("DATABASE_URL is required when PUNCHLINE_REQUIRE_DATABASE is enabled")
+		}
+		return realtime.NewMemoryRoomRegistry(), realtime.NewMemoryRoomStateStore(), func() {}
 	}
 
 	db, err := sql.Open("pgx", databaseURL)
@@ -144,5 +163,15 @@ func roomRegistry() (realtime.RoomRegistry, func()) {
 		_ = db.Close()
 		log.Fatalf("connect postgres room registry: %v", err)
 	}
-	return roomstore.NewPostgresRoomRegistry(db), func() { _ = db.Close() }
+	store := roomstore.NewPostgresRoomRegistry(db)
+	return store, store, func() { _ = db.Close() }
+}
+
+func truthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

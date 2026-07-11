@@ -1,14 +1,17 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"punchline/backend/internal/realtime"
 	"punchline/backend/internal/ws"
@@ -18,27 +21,48 @@ import (
 const maxJoinBody = 4 << 10
 
 type Handler struct {
-	manager        *realtime.RoomManager
-	allowedOrigins map[string]bool
+	manager               *realtime.RoomManager
+	allowedOrigins        map[string]bool
+	metrics               *metrics
+	metricsToken          string
+	limiter               *rateLimiter
+	proxyHeaders          proxyHeaderConfig
+	roomCreateLimitPerMin int
+	roomJoinLimitPerMin   int
+	wsConnectLimitPerMin  int
+	wsMessageLimitPerMin  int
 }
 
 var errUnknownMessage = errors.New("unknown websocket message type")
 
 func NewHandler(manager *realtime.RoomManager) *Handler {
-	return &Handler{manager: manager, allowedOrigins: parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS"))}
+	return &Handler{
+		manager:               manager,
+		allowedOrigins:        parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
+		metrics:               newMetrics(),
+		metricsToken:          strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
+		limiter:               newRateLimiter(),
+		proxyHeaders:          newProxyHeaderConfig(),
+		roomCreateLimitPerMin: getenvLimit("PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN", defaultRoomCreateLimitPerMin),
+		roomJoinLimitPerMin:   getenvLimit("PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN", defaultRoomJoinLimitPerMin),
+		wsConnectLimitPerMin:  getenvLimit("PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN", defaultWSConnectLimitPerMin),
+		wsMessageLimitPerMin:  getenvLimit("PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN", defaultWSMessageLimitPerMin),
+	}
 }
 
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.health)
 	mux.HandleFunc("/readyz", h.ready)
+	mux.HandleFunc("/metrics", h.metricsEndpoint)
+	mux.HandleFunc("/api/computer-room", h.computerRoom)
 	mux.HandleFunc("/api/rooms", h.rooms)
 	mux.HandleFunc("/api/rooms/", h.roomByCode)
 	mux.HandleFunc("/ws/rooms/", h.wsRoom)
 	if dir := staticDir(); dir != "" {
 		mux.Handle("/", spaHandler(dir))
 	}
-	return h.securityHeaders(h.cors(mux))
+	return h.instrument(h.securityHeaders(h.cors(mux)))
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +71,9 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		"ok":               true,
 		"instance_id":      stats.InstanceID,
 		"room_registry":    stats.RoomRegistry,
+		"room_state_store": stats.RoomStateStore,
 		"local_room_count": stats.LocalRoomCount,
+		"draining":         stats.Draining,
 	})
 }
 
@@ -62,9 +88,25 @@ func (h *Handler) ready(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ready": true})
 }
 
+func (h *Handler) metricsEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.metricsToken != "" && !constantTimeEqual(r.Header.Get("Authorization"), "Bearer "+h.metricsToken) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "metrics authorization required")
+		return
+	}
+	h.metrics.writePrometheus(w, h.manager.Stats())
+}
+
 func (h *Handler) rooms(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.allowRequest(w, r, "room_create", h.roomCreateLimitPerMin) {
 		return
 	}
 	room, err := h.manager.CreateRoom(r.Context())
@@ -73,7 +115,51 @@ func (h *Handler) rooms(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "could not create room")
 		return
 	}
+	h.metrics.recordRoomCreated("friends")
 	writeJSON(w, http.StatusCreated, room.SnapshotFor(""))
+}
+
+func (h *Handler) computerRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.allowRequest(w, r, "room_create", h.roomCreateLimitPerMin) {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJoinBody)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid computer room request")
+		return
+	}
+	room, err := h.manager.CreateRoom(r.Context())
+	if err != nil {
+		log.Printf("create computer room: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "could not create room")
+		return
+	}
+	player, err := room.TryJoin(req.Name)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not join room")
+		return
+	}
+	if err := room.UpdateSettings(player.ID, &realtime.Settings{ScoreLimit: 3, RoundSeconds: 45, MaxPlayers: 4}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not prepare computer room")
+		return
+	}
+	if err := room.StartComputerGame(player.ID); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not start computer room")
+		return
+	}
+	if err := h.manager.PersistRoom(r.Context(), room); err != nil {
+		log.Printf("persist computer room: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "could not save computer room")
+		return
+	}
+	h.metrics.recordRoomCreated("computer")
+	writeJSON(w, http.StatusCreated, map[string]any{"player": player, "token": player.GuestToken, "room": room.SnapshotFor(player.ID)})
 }
 
 func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +170,10 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := strings.ToUpper(parts[0])
+	isJoin := len(parts) == 2 && parts[1] == "join" && r.Method == http.MethodPost
+	if isJoin && !h.allowRequest(w, r, "room_join", h.roomJoinLimitPerMin) {
+		return
+	}
 	room, err := h.manager.GetRoom(r.Context(), code)
 	if err != nil {
 		writeRoomLookupError(w, r, err)
@@ -94,7 +184,7 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, room.SnapshotFor(""))
 		return
 	}
-	if len(parts) == 2 && parts[1] == "join" && r.Method == http.MethodPost {
+	if isJoin {
 		var req struct {
 			Name string `json:"name"`
 		}
@@ -115,6 +205,11 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "could not join room")
 			return
 		}
+		if err := h.manager.PersistRoom(r.Context(), room); err != nil {
+			log.Printf("persist joined room: %v", err)
+			writeError(w, http.StatusServiceUnavailable, "could not save room")
+			return
+		}
 		room.Broadcast()
 		writeJSON(w, http.StatusCreated, map[string]any{"player": player, "token": player.GuestToken, "room": room.SnapshotFor(player.ID)})
 		return
@@ -125,6 +220,9 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) wsRoom(w http.ResponseWriter, r *http.Request) {
 	if !h.originAllowed(r) {
 		writeError(w, http.StatusForbidden, "origin not allowed")
+		return
+	}
+	if !h.allowRequest(w, r, "ws_connect", h.wsConnectLimitPerMin) {
 		return
 	}
 	code := strings.ToUpper(strings.Trim(strings.TrimPrefix(r.URL.Path, "/ws/rooms/"), "/"))
@@ -150,7 +248,12 @@ func (h *Handler) wsRoom(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteJSON(realtime.ServerMessage{Type: "error", Error: err.Error()})
 		return
 	}
-	defer func() { room.Detach(playerID, conn); room.Broadcast() }()
+	h.metrics.recordWSConnect()
+	defer func() {
+		h.metrics.recordWSDisconnect()
+		room.Detach(playerID, conn)
+		room.Broadcast()
+	}()
 
 	// The connection's write pump emits keepalive pings on its own, so we just
 	// read client messages here and let broadcasts fan out asynchronously.
@@ -158,6 +261,16 @@ func (h *Handler) wsRoom(w http.ResponseWriter, r *http.Request) {
 	for {
 		var msg realtime.ClientMessage
 		if err := conn.ReadJSON(&msg); err != nil {
+			return
+		}
+		if h.manager.Draining() {
+			_ = conn.WriteJSON(realtime.ServerMessage{Type: "server_draining", Room: room.SnapshotFor(playerID), Error: "server is restarting; reconnect shortly"})
+			return
+		}
+		if !h.limiter.allow("ws_message:"+h.clientIP(r)+":"+playerID, h.wsMessageLimitPerMin, time.Minute) {
+			h.metrics.recordRateLimited("ws_message")
+			h.metrics.recordWSMessage(msg.Type, "rate_limited")
+			_ = conn.WriteJSON(realtime.ServerMessage{Type: "error", Room: room.SnapshotFor(playerID), Error: "too many messages"})
 			return
 		}
 		var actionErr error
@@ -178,13 +291,26 @@ func (h *Handler) wsRoom(w http.ResponseWriter, r *http.Request) {
 			actionErr = room.UpdateSettings(playerID, msg.Settings)
 		case "skip_prompt":
 			actionErr = room.SkipPrompt(playerID)
+		case "start_computer_game":
+			actionErr = room.StartComputerGame(playerID)
 		default:
 			actionErr = errUnknownMessage
 		}
 		if actionErr != nil {
+			h.metrics.recordActionError(msg.Type)
+			h.metrics.recordWSMessage(msg.Type, "error")
 			_ = conn.WriteJSON(realtime.ServerMessage{Type: "error", Room: room.SnapshotFor(playerID), Error: actionErr.Error()})
 			continue
 		}
+		if err := h.manager.PersistRoom(r.Context(), room); err != nil {
+			log.Printf("persist room action %s: %v", msg.Type, err)
+			h.metrics.recordActionError(msg.Type)
+			h.metrics.recordWSMessage(msg.Type, "error")
+			_ = conn.WriteJSON(realtime.ServerMessage{Type: "error", Room: room.SnapshotFor(playerID), Error: "could not save room state"})
+			room.Broadcast()
+			continue
+		}
+		h.metrics.recordWSMessage(msg.Type, "ok")
 		room.Broadcast()
 	}
 }
@@ -199,6 +325,20 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+func (h *Handler) allowRequest(w http.ResponseWriter, r *http.Request, scope string, limit int) bool {
+	if h.limiter.allow(scope+":"+h.clientIP(r), limit, time.Minute) {
+		return true
+	}
+	h.metrics.recordRateLimited(scope)
+	w.Header().Set("Retry-After", "60")
+	writeError(w, http.StatusTooManyRequests, "too many requests")
+	return false
+}
+
+func (h *Handler) clientIP(r *http.Request) string {
+	return h.proxyHeaders.clientIP(r)
+}
+
 func writeRoomLookupError(w http.ResponseWriter, r *http.Request, err error) {
 	var ownedElsewhere *realtime.RoomOwnedElsewhereError
 	if errors.As(err, &ownedElsewhere) {
@@ -211,6 +351,10 @@ func writeRoomLookupError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	if errors.Is(err, realtime.ErrRoomStateUnavailable) {
 		writeError(w, http.StatusGone, "room state is no longer active on this server")
+		return
+	}
+	if errors.Is(err, realtime.ErrDraining) {
+		writeError(w, http.StatusServiceUnavailable, "server is restarting; reconnect shortly")
 		return
 	}
 	if errors.Is(err, realtime.ErrRoomNotFound) {
@@ -268,7 +412,7 @@ func (h *Handler) originAllowed(r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
-	return sameHost(u.Host, r.Host)
+	return sameHost(u.Host, r.Host) || sameLoopbackHost(u.Host, r.Host)
 }
 
 func parseAllowedOrigins(raw string) map[string]bool {
@@ -292,4 +436,28 @@ func sameHost(a, b string) bool {
 		return strings.EqualFold(ah, bh) && ap == bp
 	}
 	return false
+}
+
+func sameLoopbackHost(a, b string) bool {
+	ah, _, aerr := net.SplitHostPort(a)
+	if aerr != nil {
+		ah = a
+	}
+	bh, _, berr := net.SplitHostPort(b)
+	if berr != nil {
+		bh = b
+	}
+	return isLoopbackHost(ah) && isLoopbackHost(bh)
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func constantTimeEqual(got, want string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }

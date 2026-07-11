@@ -22,6 +22,7 @@ type Player struct {
 	GuestToken string             `json:"-"`
 	Score      int                `json:"score"`
 	Connected  bool               `json:"connected"`
+	IsComputer bool               `json:"is_computer"`
 	IsJudge    bool               `json:"is_judge"`
 	Submitted  bool               `json:"submitted"`
 	Hand       []cards.AnswerCard `json:"hand,omitempty"`

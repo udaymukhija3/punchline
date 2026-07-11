@@ -130,6 +130,51 @@ func TestNeedsThreePlayers(t *testing.T) {
 	}
 }
 
+func TestStartComputerGameAddsComputerPlayersAndUsesRealLoop(t *testing.T) {
+	r := newTestRoom()
+	host := r.Join("Alice")
+
+	if err := r.StartComputerGame(host.ID); err != nil {
+		t.Fatalf("start computer game failed: %v", err)
+	}
+	snap := r.SnapshotFor(host.ID)
+	if snap.Phase != PhaseSubmitting {
+		t.Fatalf("phase = %q, want submitting", snap.Phase)
+	}
+	if len(snap.Players) != minPlayersToStart {
+		t.Fatalf("players = %d, want %d", len(snap.Players), minPlayersToStart)
+	}
+	computers := 0
+	var computerAnswererID string
+	for _, p := range snap.Players {
+		if p.IsComputer {
+			computers++
+			if p.ID != snap.JudgeID {
+				computerAnswererID = p.ID
+			}
+		}
+	}
+	if computers != 2 {
+		t.Fatalf("computer players = %d, want 2", computers)
+	}
+	if !r.players[snap.JudgeID].IsComputer {
+		t.Fatal("first computer game judge should be a computer")
+	}
+
+	hostHand := r.SnapshotFor(host.ID).Players[0].Hand
+	if err := r.SubmitAnswer(host.ID, hostHand[0].ID); err != nil {
+		t.Fatalf("host submit failed: %v", err)
+	}
+	r.submitComputerAnswer(computerAnswererID, r.phaseSeq)
+	if r.phase != PhaseJudging {
+		t.Fatalf("phase after computer submit = %q, want judging", r.phase)
+	}
+	r.pickComputerWinner(r.judgeID, r.phaseSeq)
+	if r.phase != PhaseScoring {
+		t.Fatalf("phase after computer judge = %q, want scoring", r.phase)
+	}
+}
+
 func TestTryJoinRejectsFullOrStartedRoom(t *testing.T) {
 	r := newTestRoom()
 	host := r.Join("Alice")
@@ -299,5 +344,117 @@ func TestSubmittingPhaseRedactsAnswers(t *testing.T) {
 		if s.Answer.Text != "submitted" || s.PlayerName != "" {
 			t.Fatalf("submission leaked before reveal: %+v", s)
 		}
+	}
+}
+
+func TestJudgingSnapshotRevealsCardsButHidesAuthorsAndOtherHands(t *testing.T) {
+	r := newTestRoom()
+	host := r.Join("Alice")
+	r.Join("Bob")
+	r.Join("Carol")
+	if err := r.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	answererIDs := make([]string, 0, 2)
+	submitted := map[string]string{}
+	for _, id := range r.order {
+		if id == r.judgeID {
+			continue
+		}
+		answererIDs = append(answererIDs, id)
+		card := r.players[id].Hand[0]
+		submitted[card.ID] = card.Text
+		if err := r.SubmitAnswer(id, card.ID); err != nil {
+			t.Fatalf("submit failed: %v", err)
+		}
+	}
+	if r.phase != PhaseJudging {
+		t.Fatalf("phase = %q, want judging", r.phase)
+	}
+
+	judgeSnap := r.SnapshotFor(r.judgeID)
+	if len(judgeSnap.Submissions) != len(answererIDs) {
+		t.Fatalf("judge saw %d submissions, want %d", len(judgeSnap.Submissions), len(answererIDs))
+	}
+	for _, s := range judgeSnap.Submissions {
+		if s.PlayerID != "" || s.PlayerName != "" {
+			t.Fatalf("judging snapshot leaked authorship: %+v", s)
+		}
+		if s.Answer.Text == "" || s.Answer.Text == "submitted" {
+			t.Fatalf("judging snapshot did not reveal answer text: %+v", s)
+		}
+		if submitted[s.Answer.ID] != s.Answer.Text {
+			t.Fatalf("judging snapshot showed unexpected answer card: %+v", s.Answer)
+		}
+	}
+	for _, p := range judgeSnap.Players {
+		if p.ID == r.judgeID {
+			if len(p.Hand) == 0 {
+				t.Fatal("viewer should still receive their own hand")
+			}
+			continue
+		}
+		if len(p.Hand) != 0 {
+			t.Fatalf("judge snapshot leaked %s's hand", p.Name)
+		}
+	}
+
+	answererSnap := r.SnapshotFor(answererIDs[0])
+	for _, p := range answererSnap.Players {
+		if p.ID == answererIDs[0] {
+			if len(p.Hand) == 0 {
+				t.Fatal("answerer should receive their own remaining hand")
+			}
+			continue
+		}
+		if len(p.Hand) != 0 {
+			t.Fatalf("answerer snapshot leaked %s's hand", p.Name)
+		}
+	}
+}
+
+func TestJudgeOnlyPickWinnerAndHostOnlyRoundAdvance(t *testing.T) {
+	r := newTestRoom()
+	host := r.Join("Alice")
+	r.Join("Bob")
+	r.Join("Carol")
+	if err := r.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var nonJudgeID string
+	for _, id := range r.order {
+		if id == r.judgeID {
+			continue
+		}
+		if nonJudgeID == "" {
+			nonJudgeID = id
+		}
+		card := r.players[id].Hand[0]
+		if err := r.SubmitAnswer(id, card.ID); err != nil {
+			t.Fatalf("submit failed: %v", err)
+		}
+	}
+	if r.phase != PhaseJudging {
+		t.Fatalf("phase = %q, want judging", r.phase)
+	}
+	var subID string
+	for id := range r.submissions {
+		subID = id
+		break
+	}
+
+	if err := r.PickWinner(nonJudgeID, subID); err == nil {
+		t.Fatal("non-judge was allowed to pick the winner")
+	}
+	if err := r.PickWinner(r.judgeID, subID); err != nil {
+		t.Fatalf("judge pick failed: %v", err)
+	}
+	if err := r.NextRound(nonJudgeID); err == nil {
+		t.Fatal("non-host was allowed to advance the round")
+	}
+	if err := r.NextRound(host.ID); err != nil {
+		t.Fatalf("host next round failed: %v", err)
 	}
 }

@@ -31,10 +31,11 @@ What works today:
   stay hidden while the judge is choosing.
 - Run from one production container that serves the API, WebSockets, and built
   frontend from the same origin.
-- Optionally use Postgres as a shared room ownership registry. With
-  `DATABASE_URL`, room codes are leased to an instance id so wrong-machine API
-  and WebSocket requests can return `421 Misdirected Request` plus
-  `Fly-Replay: instance=<owner>` before upgrade.
+- Optionally use Postgres for room ownership and durable active-room snapshots.
+  With `DATABASE_URL`, room codes are leased to an instance id, wrong-machine
+  API/WebSocket requests return `421 Misdirected Request` plus
+  `Fly-Replay: instance=<owner>`, and a new owner can restore a room after a
+  graceful release or expired lease.
 - Expose health/readiness probes, security headers, origin checks, request-size
   limits, WebSocket message-size limits, keepalive pings, bounded socket send
   queues, idle-room eviction, and local room caps.
@@ -43,7 +44,6 @@ What works today:
 
 What is not shipped yet:
 
-- Full durable room-state recovery after the owner process restarts.
 - Persistent accounts, user profiles, match history, or durable game results.
 - Runtime database-backed card/deck loading. The current game loads
   `seed/cards.json` at startup; the SQL schema and planning docs include future
@@ -73,16 +73,18 @@ Accurate bullets:
   browser reconnection through guest session tokens.
 - Added production-oriented deployment hardening: one-container API/WS/UI
   runtime, health/readiness probes, security headers, origin checks, Docker/CI,
-  smoke testing, and optional Postgres room ownership leases for Fly.io replay
-  routing.
+  Postgres-backed room snapshots, owner leases, and Fly.io replay routing.
+
+Evidence map: `docs/RECRUITER_EVIDENCE.md`.
 
 Do not claim these as shipped unless the implementation changes after this
 README:
 
 - Do not call it a Next.js or TypeScript app. The current frontend is Vite +
   React JavaScript.
-- Do not claim durable recovery of active games after server restart. Active
-  gameplay state is still in memory on the owning process.
+- Do not claim persistent match history or zero-downtime recovery from every
+  failure. Active rooms recover from Postgres snapshots after graceful release
+  or lease expiry, while guest sessions remain browser-local.
 - Do not claim persistent accounts, match history, durable game results, or
   database-backed deck serving.
 - Do not claim the async daily mode, moderation workflow, reporting UI, or
@@ -117,6 +119,7 @@ README:
 
 ```txt
 backend/     Go API, WebSocket transport, room manager, and game engine
+docs/        Recruiter-facing evidence map for shipped capabilities
 frontend/    Vite + React client with reconnecting guest sessions
 migrations/  Postgres schema, including room ownership lease columns
 seed/        Prompt and answer card seed deck loaded by the server at startup
@@ -180,17 +183,19 @@ go run ./cmd/api
 ```
 
 Fresh Docker Compose databases apply `migrations/` automatically. Existing
-databases must have `migrations/002_room_instance_leases.sql` applied before
-turning on `DATABASE_URL`.
+databases must run the migration runner before turning on `DATABASE_URL`;
+`migrations/003_room_state_snapshots.sql` adds active-room recovery.
 
 Useful registry env vars:
 
 ```txt
-DATABASE_URL             Enables the Postgres room registry.
-PUNCHLINE_INSTANCE_ID    Overrides the process instance id.
-ROOM_LEASE_TTL           Active-room lease duration, default 6h.
-DB_MAX_OPEN_CONNS        Postgres pool cap, default 10.
-DB_MAX_IDLE_CONNS        Postgres idle pool cap, default 5.
+DATABASE_URL                Enables Postgres ownership and durable state.
+PUNCHLINE_INSTANCE_ID       Overrides the process instance id.
+PUNCHLINE_REQUIRE_DATABASE  Fails startup when production DB is missing.
+ROOM_LEASE_TTL              Active-room lease duration, default 90s.
+ROOM_HEARTBEAT_INTERVAL     Lease heartbeat interval, default 15s.
+DB_MAX_OPEN_CONNS           Postgres pool cap, default 10.
+DB_MAX_IDLE_CONNS           Postgres idle pool cap, default 5.
 ```
 
 ## Run the production image locally
@@ -205,15 +210,16 @@ docker run -p 8080:8080 punchline
 
 Open `http://localhost:8080`.
 
-Run the real-time smoke test against any running instance:
+Run the deploy check against the production-shaped container:
 
 ```bash
-node scripts/smoke-realtime.mjs http://localhost:8080
+node scripts/deploy-check.mjs http://localhost:8080
 ```
 
-The smoke creates a room, joins three players, opens three authenticated
-WebSockets, starts a round, submits answers, picks a winner, advances the next
-round, checks judge rotation, and prints phase-transition timings.
+The check verifies the React app shell and built assets, `/readyz`, `/metrics`,
+then creates a room, joins three players, opens three authenticated WebSockets,
+starts a round, submits answers, picks a winner, advances the next round,
+checks judge rotation, and prints phase-transition timings.
 
 ## Demo deployment checklist
 
@@ -240,10 +246,10 @@ Open `http://localhost:8080`, create a room, join from two more tabs or
 phones, start a round, submit answers, pick a winner, and advance to the next
 round.
 
-Run the automated smoke test against the same local image:
+Run the automated deploy check against the same local image:
 
 ```bash
-node scripts/smoke-realtime.mjs http://localhost:8080
+node scripts/deploy-check.mjs http://localhost:8080
 ```
 
 ## Fast public demo on Render
@@ -260,7 +266,7 @@ No database is required for a single-instance demo.
 6. Run:
 
 ```bash
-node scripts/smoke-realtime.mjs https://<your-render-app>.onrender.com
+node scripts/deploy-check.mjs https://<your-render-app>.onrender.com
 ```
 
 Free Render services can cold-start after being idle. Open the URL once before
@@ -272,7 +278,7 @@ sharing it so the first reviewer does not wait through the spin-up page.
 fly launch --copy-config --no-deploy
 fly deploy
 fly status
-node scripts/smoke-realtime.mjs https://<your-app>.fly.dev
+node scripts/deploy-check.mjs https://<your-app>.fly.dev
 ```
 
 For the current demo, run one machine unless `DATABASE_URL` is configured:
@@ -282,25 +288,29 @@ fly scale count 1
 ```
 
 After `fly deploy`, verify the public URL the same way: open the page, create a
-room, join two more players, complete a round, and run the smoke script above
+room, join two more players, complete a round, and run the deploy check above
 against the Fly URL.
 
 With `DATABASE_URL` configured, Fly can replay wrong-machine traffic to the
 owning machine because the server returns `Fly-Replay: instance=<owner>` before
-the WebSocket upgrade. This prevents split-brain room creation across machines.
+the WebSocket upgrade. Active state is snapshotted in Postgres, graceful
+shutdown releases leases for immediate recovery, and an ungraceful owner loss
+can be claimed after the room lease expires.
 
 Without `DATABASE_URL`, keep the app at one machine. The fallback registry is
 memory-only.
 
-Even with Postgres room ownership enabled, active gameplay state still lives in
-the owning process. A restart of that owner ends its active rooms until durable
-room-state restore is implemented.
-
 Production env vars worth setting before sharing a public link:
 
 ```txt
-DATABASE_URL                 Postgres room registry for multi-machine routing.
+DATABASE_URL                 Postgres ownership and active-room state store.
 PUNCHLINE_ALLOWED_ORIGINS    Optional comma-separated extra browser origins.
+PUNCHLINE_REQUIRE_DATABASE   Set true for production.
+PUNCHLINE_METRICS_TOKEN      Optional bearer token for /metrics.
+PUNCHLINE_TRUST_PROXY_HEADERS
+                             Trust Fly-Client-IP/X-Real-IP/X-Forwarded-For from any peer.
+PUNCHLINE_TRUSTED_PROXY_CIDRS
+                             Comma-separated proxy CIDRs allowed to set client IP headers.
 MAX_LOCAL_ROOMS              Per-process room cap; Fly default is 500.
 ROOM_IDLE_TTL                Idle empty-room eviction window; Fly default is 20m.
 DB_MAX_OPEN_CONNS            Postgres pool cap, default 10.
@@ -373,10 +383,6 @@ judging.
 
 ## Roadmap
 
-The most important next production step is durable active-room recovery: persist
-enough room state and command history for an owner-machine restart to restore a
-live game, not only route traffic to the current owner.
-
-After that, likely next slices are persistent results, accounts, DB-backed deck
+Likely next slices are persistent results, accounts, DB-backed deck
 loading, content moderation/reporting, async daily rooms, and a public hosted
 demo that matches the exact runtime described here.

@@ -1,9 +1,8 @@
 # Fly.io deployment for PUNCHLINE.
 #
-# With DATABASE_URL set, room codes are reserved in Postgres with the owning
-# Fly machine id. Wrong-machine API/WS hits return Fly-Replay before upgrade so
-# Fly can route the request to the room owner. Without DATABASE_URL, keep this
-# app at one machine because the registry falls back to memory.
+# Production requires Postgres for room ownership and durable active-game
+# snapshots. Wrong-machine API/WS hits return Fly-Replay before upgrade so Fly
+# can route the request to the current owner.
 
 app = "punchline"
 primary_region = "iad"
@@ -11,10 +10,21 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  release_command = "/app/migrate"
+
 [env]
   PORT = "8080"
   MAX_LOCAL_ROOMS = "500"
   ROOM_IDLE_TTL = "20m"
+  ROOM_LEASE_TTL = "90s"
+  ROOM_HEARTBEAT_INTERVAL = "15s"
+  SHUTDOWN_DRAIN_GRACE = "5s"
+  PUNCHLINE_REQUIRE_DATABASE = "true"
+  PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN = "20"
+  PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN = "80"
+  PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN = "120"
+  PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN = "240"
 
 [http_service]
   internal_port = 8080

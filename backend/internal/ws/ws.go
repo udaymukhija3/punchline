@@ -69,6 +69,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if r.Method != http.MethodGet {
 		return nil, errors.New("websocket upgrade must use GET")
 	}
+	if !headerHasToken(r.Header, "Connection", "Upgrade") {
+		return nil, errors.New("missing websocket connection upgrade token")
+	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		return nil, errors.New("missing websocket upgrade header")
 	}
@@ -76,8 +79,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 		return nil, errors.New("unsupported websocket version")
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, errors.New("missing websocket key")
+	if !validClientKey(key) {
+		return nil, errors.New("invalid websocket key")
 	}
 	h, ok := w.(http.Hijacker)
 	if !ok {
@@ -87,9 +90,21 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := nc.SetDeadline(time.Time{}); err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
 	accept := acceptKey(key)
+	if err := nc.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
 	_, err = fmt.Fprintf(nc, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept)
 	if err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
+	if err := nc.SetWriteDeadline(time.Time{}); err != nil {
 		_ = nc.Close()
 		return nil, err
 	}
@@ -103,8 +118,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	return c, nil
 }
 
-// Close signals the write pump to flush and shut down. Safe to call repeatedly
-// and from multiple goroutines.
+// Close signals the write pump to send a close frame and shut down. Safe to
+// call repeatedly and from multiple goroutines.
 func (c *Conn) Close() error {
 	c.closeInternal()
 	return nil
@@ -115,8 +130,9 @@ func (c *Conn) closeInternal() {
 }
 
 // writePump is the only goroutine that writes to the socket. It serialises
-// application frames, emits keepalive pings, and on shutdown drains buffered
-// frames best-effort before sending a close frame.
+// application frames, emits keepalive pings, and on shutdown sends a close
+// frame. Buffered application messages are discarded so a slow client cannot
+// hold process shutdown hostage.
 func (c *Conn) writePump() {
 	ticker := time.NewTicker(PingInterval)
 	defer ticker.Stop()
@@ -125,7 +141,6 @@ func (c *Conn) writePump() {
 	for {
 		select {
 		case <-c.done:
-			c.drain()
 			_ = c.writeFrame(opClose, nil)
 			return
 		case f := <-c.send:
@@ -138,17 +153,6 @@ func (c *Conn) writePump() {
 				c.closeInternal()
 				return
 			}
-		}
-	}
-}
-
-func (c *Conn) drain() {
-	for {
-		select {
-		case f := <-c.send:
-			_ = c.writeFrame(f.opcode, f.payload)
-		default:
-			return
 		}
 	}
 }
@@ -210,6 +214,9 @@ func (c *Conn) readMessage() ([]byte, error) {
 		case opPong:
 			// keepalive acknowledgement; read deadline already refreshed
 		case opText, opBinary:
+			if fragmented {
+				return nil, errors.New("new websocket data frame before fragmented message completed")
+			}
 			if len(data)+len(payload) > maxClientMessageBytes {
 				return nil, errors.New("websocket message too large")
 			}
@@ -240,9 +247,15 @@ func (c *Conn) readFrame() (opcode byte, payload []byte, fin bool, err error) {
 	if _, err = io.ReadFull(c.br, head); err != nil {
 		return 0, nil, false, err
 	}
+	if head[0]&0x70 != 0 {
+		return 0, nil, false, errors.New("websocket extensions are not supported")
+	}
 	fin = head[0]&0x80 != 0
 	opcode = head[0] & 0x0F
 	masked := head[1]&0x80 != 0
+	if !masked {
+		return 0, nil, false, errors.New("client websocket frames must be masked")
+	}
 	length := uint64(head[1] & 0x7F)
 	if length == 126 {
 		var b [2]byte
@@ -250,15 +263,27 @@ func (c *Conn) readFrame() (opcode byte, payload []byte, fin bool, err error) {
 			return 0, nil, false, err
 		}
 		length = uint64(binary.BigEndian.Uint16(b[:]))
+		if length < 126 {
+			return 0, nil, false, errors.New("websocket frame used non-minimal length encoding")
+		}
 	} else if length == 127 {
 		var b [8]byte
 		if _, err = io.ReadFull(c.br, b[:]); err != nil {
 			return 0, nil, false, err
 		}
+		if b[0]&0x80 != 0 {
+			return 0, nil, false, errors.New("websocket frame length is invalid")
+		}
 		length = binary.BigEndian.Uint64(b[:])
+		if length < 65536 {
+			return 0, nil, false, errors.New("websocket frame used non-minimal length encoding")
+		}
 	}
 	if length > maxClientMessageBytes {
 		return 0, nil, false, errors.New("websocket frame too large")
+	}
+	if opcode >= opClose && (!fin || length > 125) {
+		return 0, nil, false, errors.New("invalid websocket control frame")
 	}
 	var mask [4]byte
 	if masked {
@@ -313,4 +338,20 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 func acceptKey(key string) string {
 	h := sha1.Sum([]byte(key + magicGUID))
 	return base64.StdEncoding.EncodeToString(h[:])
+}
+
+func validClientKey(key string) bool {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
+	return err == nil && len(decoded) == 16
+}
+
+func headerHasToken(header http.Header, name string, want string) bool {
+	for _, value := range header.Values(name) {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), want) {
+				return true
+			}
+		}
+	}
+	return false
 }

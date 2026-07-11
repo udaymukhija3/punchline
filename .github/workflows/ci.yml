@@ -19,6 +19,7 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./...
+      - run: go test -race ./...
 
   frontend:
     runs-on: ubuntu-latest
@@ -44,3 +45,49 @@ jobs:
         with:
           context: .
           push: false
+
+  smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: punchline
+          POSTGRES_PASSWORD: punchline
+          POSTGRES_DB: punchline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U punchline -d punchline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: go build -o /tmp/punchline-api ./cmd/api
+        working-directory: backend
+      - run: go build -o /tmp/punchline-migrate ./cmd/migrate
+        working-directory: backend
+      - run: |
+          set -euo pipefail
+          export DATABASE_URL='postgres://punchline:punchline@localhost:5432/punchline?sslmode=disable'
+          export PUNCHLINE_REQUIRE_DATABASE=true
+          /tmp/punchline-migrate
+          (cd backend && go test ./internal/roomstore -run TestPostgresReleaseRetainsRoomState -count=1)
+          PORT=18080 /tmp/punchline-api &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18080/readyz >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:18080/readyz >/dev/null
+          node scripts/smoke-realtime.mjs http://127.0.0.1:18080

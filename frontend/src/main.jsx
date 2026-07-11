@@ -23,22 +23,16 @@ const clearSession = () => localStorage.removeItem(SESSION_KEY);
 const normalizeRoomCode = (value) => value.replace(/[^a-z0-9]/gi, '').slice(0, 4).toUpperCase();
 const MIN_PLAYERS = 3;
 
-const demoBuilt = [
-  'Live rooms with invite links and 4-character room codes.',
-  'A full 3+ player loop: lobby, prompts, private hands, judging, scoring, and play again.',
-  'Reconnectable guest sessions, host settings, content tiers, and a larger seed deck.',
+const tutorialSteps = [
+  ['1', 'Read the prompt', 'One player judges while the room gets a ridiculous blank to fill.'],
+  ['2', 'Play a card', 'Everyone else picks one answer from a private hand.'],
+  ['3', 'Win the laugh', 'The judge chooses blind, scores update, and the judge rotates.'],
 ];
 
-const demoRunSteps = [
-  ['Backend', ['cd backend', 'go run ./cmd/api']],
-  ['Frontend', ['cd frontend', 'npm install', 'npm run dev']],
-  ['Open', ['http://localhost:5173']],
-];
-
-const demoVerify = [
-  'Open three browser tabs or phones.',
-  'Create a room, join with two names, then start the game.',
-  'Submit answers, pick a winner, and confirm the next round rotates the judge.',
+const roomBeats = [
+  'Computer seats can teach the first round.',
+  'Invite links still work when the room is ready.',
+  'First to the score limit wins.',
 ];
 
 async function readPayload(res) {
@@ -121,17 +115,23 @@ function App() {
 
   const send = (type, payload = {}) => ws.current?.send(JSON.stringify({ type, ...payload }));
 
-  async function joinCreatedRoom(code, name) {
+  function activateRoomSession(code, name, data, mode = 'friends') {
+    if (!data?.player?.id || !data?.token || !data?.room) throw new Error('The server returned an incomplete room session.');
+    const c = normalizeRoomCode(code || data.room?.code || '');
+    if (c.length !== 4) throw new Error('The server did not return a room code.');
+    const sess = { code: c, playerId: data.player.id, token: data.token, name, mode };
+    everOpened.current = false; retries.current = 0;
+    saveSession(sess); setSession(sess); setRoom(data.room); connect(sess);
+  }
+
+  async function joinCreatedRoom(code, name, mode = 'friends') {
     const c = normalizeRoomCode(code);
     const res = await fetch(`${API}/api/rooms/${c}/join`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
     });
     const data = await readPayload(res);
     if (!res.ok) throw new Error(data.error || 'Could not join that room.');
-    if (!data?.player?.id || !data?.token || !data?.room) throw new Error('The server returned an incomplete room session.');
-    const sess = { code: c, playerId: data.player.id, token: data.token, name };
-    everOpened.current = false; retries.current = 0;
-    saveSession(sess); setSession(sess); setRoom(data.room); connect(sess);
+    activateRoomSession(c, name, data, mode);
   }
 
   async function createAndJoin(name) {
@@ -145,6 +145,23 @@ function App() {
       await joinCreatedRoom(data.code, name);
     } catch (err) {
       setError(errorMessage(err, 'Could not create a room.'));
+    } finally {
+      setBusyAction('');
+    }
+  }
+
+  async function playComputer(name) {
+    setError('');
+    setBusyAction('computer');
+    try {
+      const res = await fetch(`${API}/api/computer-room`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+      });
+      const data = await readPayload(res);
+      if (!res.ok) throw new Error(data.error || 'Could not start a computer room.');
+      activateRoomSession(data.room?.code, name, data, 'computer');
+    } catch (err) {
+      setError(errorMessage(err, 'Could not start a computer room.'));
     } finally {
       setBusyAction('');
     }
@@ -172,16 +189,17 @@ function App() {
   }
 
   if (!session || !room) {
-    return <Landing onCreate={createAndJoin} onJoin={join} error={error} reconnecting={!!session} busyAction={busyAction} />;
+    return <Landing onCreate={createAndJoin} onJoin={join} onComputer={playComputer} error={error} reconnecting={!!session} busyAction={busyAction} />;
   }
   return <Game room={room} me={session.playerId} status={status} error={error} send={send} onLeave={leave} />;
 }
 
-function Landing({ onCreate, onJoin, error, reconnecting, busyAction }) {
+function Landing({ onCreate, onJoin, onComputer, error, reconnecting, busyAction }) {
   const [name, setName] = useState(localStorage.getItem('punchline.name') || '');
   const [code, setCode] = useState(normalizeRoomCode(new URLSearchParams(location.search).get('join') || ''));
   const remember = (n) => { setName(n); localStorage.setItem('punchline.name', n); };
   const cleanName = name.trim();
+  const canPlayComputer = !!cleanName && !busyAction;
   const canCreate = !!cleanName && !busyAction;
   const canJoin = !!cleanName && code.length === 4 && !busyAction;
 
@@ -190,56 +208,48 @@ function Landing({ onCreate, onJoin, error, reconnecting, busyAction }) {
   }
   return (
     <main className="shell landing">
-      <section className="landing-hero">
+      <section className="landing-hero" aria-label="Punchline start">
         <div className="brand-block">
+          <span className="eyebrow">Prompt. Answer. Judge. Repeat.</span>
           <div className="logo">Punchline</div>
-          <p className="tagline">A demo build of a live, browser-based party game.</p>
-          <p className="demo-note">Use this page to start a room, then use the checklist below to verify the product flow.</p>
+          <p className="tagline">A live party game where the funniest answer wins the room.</p>
+          <div className="tutorial-steps" aria-label="How a round works">
+            {tutorialSteps.map(([number, title, body]) => (
+              <div className="tutorial-step" key={title}>
+                <span>{number}</span>
+                <div>
+                  <b>{title}</b>
+                  <p>{body}</p>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="panel" aria-busy={!!busyAction}>
-          <label>Your name</label>
-          <input className="field" placeholder="e.g. Sam" value={name} maxLength={20} autoComplete="nickname" onChange={(e) => remember(e.target.value)} />
-          <button className="btn primary block" disabled={!canCreate} onClick={() => onCreate(cleanName)}>
-            {busyAction === 'create' ? 'Creating room...' : 'Create a room'}
+        <div className="panel start-panel" aria-busy={!!busyAction}>
+          <div className="panel-title">
+            <span className="eyebrow">Start here</span>
+            <h1>Try a round first</h1>
+          </div>
+          <label htmlFor="player-name">Your name</label>
+          <input id="player-name" className="field" placeholder="e.g. Sam" value={name} maxLength={20} autoComplete="nickname" onChange={(e) => remember(e.target.value)} />
+          <button className="btn primary block cta" disabled={!canPlayComputer} onClick={() => onComputer(cleanName)}>
+            {busyAction === 'computer' ? 'Starting computer room...' : 'Play with computer'}
           </button>
-          <div className="divider"><span>or join one</span></div>
-          <div className="row">
-            <input className="field code-input" placeholder="Code" value={code} maxLength={4} autoCapitalize="characters" autoComplete="off"
+          <ul className="beat-list">
+            {roomBeats.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+          <div className="divider"><span>or bring people in</span></div>
+          <button className="btn primary block" disabled={!canCreate} onClick={() => onCreate(cleanName)}>
+            {busyAction === 'create' ? 'Creating room...' : 'Host friends'}
+          </button>
+          <div className="join-box">
+            <input className="field code-input" aria-label="Room code" placeholder="Code" value={code} maxLength={4} autoCapitalize="characters" autoComplete="off"
                    onChange={(e) => setCode(normalizeRoomCode(e.target.value))} />
             <button className="btn block" disabled={!canJoin} onClick={() => onJoin(code, cleanName)}>
               {busyAction === 'join' ? 'Joining...' : 'Join'}
             </button>
           </div>
           {error && <p className="err" role="alert">{error}</p>}
-        </div>
-      </section>
-
-      <section className="demo-guide" aria-label="Demo guide">
-        <div className="demo-section">
-          <h2>Built</h2>
-          <ul className="plain-list">
-            {demoBuilt.map((item) => <li key={item}>{item}</li>)}
-          </ul>
-        </div>
-        <div className="demo-section">
-          <h2>Run locally</h2>
-          <ol className="run-steps">
-            {demoRunSteps.map(([label, commands]) => (
-              <li key={label}>
-                <span>{label}</span>
-                <div className="command-stack">
-                  {commands.map((command) => <code key={command}>{command}</code>)}
-                </div>
-              </li>
-            ))}
-          </ol>
-        </div>
-        <div className="demo-section">
-          <h2>Verify</h2>
-          <ol className="plain-list numbered">
-            {demoVerify.map((item) => <li key={item}>{item}</li>)}
-          </ol>
-          <p className="muted small">Best with 3+ players. Works on phones. No install.</p>
         </div>
       </section>
     </main>
@@ -344,16 +354,21 @@ function Game({ room, me, status, error, send, onLeave }) {
               <div className="player-meta">
                 {room.phase === 'submitting'
                   ? <span className={`sub-status ${playerRoundStatus(p, room.phase)}`}>{playerRoundLabel(p)}</span>
-                  : <span className={`conn-label ${p.connected ? 'on' : 'off'}`}>{p.connected ? 'Online' : 'Away'}</span>}
+                  : p.is_computer
+                    ? <span className="conn-label bot">Computer</span>
+                    : <span className={`conn-label ${p.connected ? 'on' : 'off'}`}>{p.connected ? 'Online' : 'Away'}</span>}
                 <span className="score">{p.score}</span>
               </div>
             </div>
           ))}
           {room.phase === 'lobby' && (
             isHost
-              ? <button className="btn primary block" disabled={neededPlayers > 0} onClick={() => send('start_game')}>
-                  {neededPlayers > 0 ? `Need ${plural(neededPlayers, 'more player')}` : 'Start game'}
-                </button>
+              ? <div className="stack-actions">
+                  {neededPlayers > 0
+                    ? <button className="btn primary block" onClick={() => send('start_computer_game')}>Start with computer</button>
+                    : <button className="btn primary block" onClick={() => send('start_game')}>Start game</button>}
+                  <button className="btn ghost block small" onClick={shareRoom}>Invite friends</button>
+                </div>
               : <p className="muted small">Waiting for the host to start...</p>
           )}
           {isHost && room.phase !== 'lobby' && room.phase !== 'finished' && (
@@ -363,22 +378,14 @@ function Game({ room, me, status, error, send, onLeave }) {
 
         <div className="stage card">
           {room.phase === 'lobby' && (
-            <div className="center-stage">
-              <h2>{isHost ? 'Build the room' : 'You are in'}</h2>
-              <p className="stage-copy">
-                {isHost
-                  ? neededPlayers > 0
-                    ? `Invite ${plural(neededPlayers, 'more player')} to start.`
-                    : 'The room is ready. Start when everyone has settled.'
-                  : 'Keep this tab open. The host starts the first round.'}
-              </p>
-              <button className="big-code" onClick={copyLink}>{room.code}</button>
-              <div className="invite-actions">
-                <button className="btn primary" onClick={shareRoom}>Invite players</button>
-                <button className="btn" onClick={copyLink}>Copy link</button>
-              </div>
-              <RoomSettings room={room} isHost={isHost} send={send} />
-            </div>
+            <LobbyStage
+              room={room}
+              isHost={isHost}
+              neededPlayers={neededPlayers}
+              shareRoom={shareRoom}
+              copyLink={copyLink}
+              send={send}
+            />
           )}
 
           {room.phase === 'finished' && <Finished room={room} isHost={isHost} send={send} />}
@@ -442,6 +449,58 @@ function Game({ room, me, status, error, send, onLeave }) {
   );
 }
 
+function LobbyStage({ room, isHost, neededPlayers, shareRoom, copyLink, send }) {
+  const previewSeats = [...room.players];
+  while (previewSeats.length < Math.min(room.max_players, 4)) previewSeats.push(null);
+  const computers = room.players.filter((p) => p.is_computer).length;
+
+  return (
+    <div className="lobby-stage">
+      <div className="lobby-copy">
+        <span className="eyebrow">{computers > 0 ? 'Computer room' : 'Live room'}</span>
+        <h2>{isHost ? 'Choose how this table starts' : 'You are at the table'}</h2>
+        <p>
+          {isHost
+            ? neededPlayers > 0
+              ? 'Practice now with computer players, or send the room code when friends are ready.'
+              : 'The table has enough players. Start whenever the room is settled.'
+            : 'Keep this tab open. The host starts the first prompt.'}
+        </p>
+      </div>
+
+      <div className="table-preview" aria-label="Room seats">
+        <button className="table-code" onClick={copyLink} title="Copy invite link">
+          <span>Room</span>
+          <b>{room.code}</b>
+        </button>
+        <div className="seat-grid">
+          {previewSeats.map((player, index) => (
+            <div className={`seat ${player ? 'filled' : 'open'} ${player?.is_computer ? 'computer' : ''}`} key={player?.id || `open-${index}`}>
+              <span className="seat-index">{index + 1}</span>
+              <b>{player?.name || 'Open seat'}</b>
+              <small>{player ? (player.is_computer ? 'Computer' : player.id === room.host_id ? 'Host' : 'Player') : 'Invite or fill'}</small>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {isHost ? (
+        <div className="lobby-actions">
+          {neededPlayers > 0
+            ? <button className="btn primary" onClick={() => send('start_computer_game')}>Play with computer</button>
+            : <button className="btn primary" onClick={() => send('start_game')}>Start game</button>}
+          <button className="btn" onClick={shareRoom}>Invite friends</button>
+          <button className="btn ghost" onClick={copyLink}>Copy link</button>
+        </div>
+      ) : (
+        <p className="muted small">Waiting for the host to pick the start.</p>
+      )}
+
+      <RoomSettings room={room} isHost={isHost} send={send} />
+    </div>
+  );
+}
+
 function PhasePanel({ room, isHost, isJudge, meP, judge, submittedCount, answererCount, send }) {
   const judgeName = judge?.name || 'The judge';
   let title = '';
@@ -491,6 +550,7 @@ function RoleBadges({ player, room, me }) {
     <span className="role-stack">
       {player.id === me && <span className="role-badge you-badge">You</span>}
       {player.id === room.host_id && <span className="role-badge">Host</span>}
+      {player.is_computer && <span className="role-badge bot-badge">CPU</span>}
       {player.is_judge && <span className="role-badge judge-badge">Judge</span>}
     </span>
   );
@@ -504,6 +564,7 @@ function playerRoundStatus(player, phase) {
 
 function playerRoundLabel(player) {
   if (player.is_judge) return 'Judge';
+  if (player.is_computer) return player.submitted ? 'In' : 'Thinking';
   return player.submitted ? 'In' : 'Choosing';
 }
 

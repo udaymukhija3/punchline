@@ -8,6 +8,14 @@ function now() {
   return Date.now();
 }
 
+async function messageText(data) {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+  if (typeof data?.text === 'function') return data.text();
+  throw new Error(`unsupported websocket message payload: ${Object.prototype.toString.call(data)}`);
+}
+
 async function post(path, body) {
   const started = now();
   const res = await fetch(`${target}${path}`, {
@@ -37,11 +45,18 @@ function openClient(code, player, token) {
       ws.close();
     },
   };
-  ws.addEventListener('message', async (ev) => {
-    const msg = JSON.parse(await ev.data.text?.() || ev.data);
-    client.messages.push(msg);
-    if (msg.room) client.room = msg.room;
-    if (msg.error) client.error = msg.error;
+  let messageQueue = Promise.resolve();
+  ws.addEventListener('message', (ev) => {
+    // Blob decoding is asynchronous in Node's WebSocket implementation. Keep
+    // snapshots in wire order so an older room_state cannot overwrite a newer
+    // phase in this deploy gate.
+    messageQueue = messageQueue.then(async () => {
+      const payload = await messageText(ev.data);
+      const msg = JSON.parse(payload);
+      client.messages.push(msg);
+      if (msg.room) client.room = msg.room;
+      if (msg.error) client.error = msg.error;
+    }).catch((err) => { client.error = err.message; });
   });
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`websocket open timed out for ${player.name}`)), deadlineMs);

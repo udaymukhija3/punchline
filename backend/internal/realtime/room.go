@@ -31,6 +31,12 @@ const (
 	maxPlayersCeiling = 20
 )
 
+const (
+	computerSubmitDelay = 900 * time.Millisecond
+	computerJudgeDelay  = 1300 * time.Millisecond
+	computerDelayJitter = 900
+)
+
 var (
 	ErrRoomFull           = errors.New("room is full")
 	ErrRoomAlreadyStarted = errors.New("game already started")
@@ -39,6 +45,8 @@ var (
 	errNotFound     = errors.New("player not found")
 	errInvalidToken = errors.New("invalid player token")
 )
+
+var computerNames = []string{"Mira CPU", "Dex CPU", "Nova CPU", "Jules CPU", "Remy CPU", "Kit CPU"}
 
 type Room struct {
 	mu            sync.Mutex
@@ -66,28 +74,176 @@ type Room struct {
 	clients       map[string]map[*ws.Conn]bool
 	createdAt     time.Time
 	updatedAt     time.Time
+	stateVersion  uint64
+	stateObserver func(PersistedRoomState)
 }
 
 func NewRoom(code string, deck cards.Deck) *Room {
 	now := time.Now().UTC()
 	r := &Room{
-		code:        code,
-		fullDeck:    deck,
-		phase:       PhaseLobby,
-		scoreLimit:  defaultScoreLimit,
-		submitSecs:  defaultSubmitSecs,
-		maxPlayers:  defaultMaxPlayers,
-		contentTier: cards.TierParty,
-		players:     map[string]*Player{},
-		submissions: map[string]Submission{},
-		clients:     map[string]map[*ws.Conn]bool{},
-		createdAt:   now,
-		updatedAt:   now,
+		code:         code,
+		fullDeck:     deck,
+		phase:        PhaseLobby,
+		scoreLimit:   defaultScoreLimit,
+		submitSecs:   defaultSubmitSecs,
+		maxPlayers:   defaultMaxPlayers,
+		contentTier:  cards.TierParty,
+		players:      map[string]*Player{},
+		submissions:  map[string]Submission{},
+		clients:      map[string]map[*ws.Conn]bool{},
+		createdAt:    now,
+		updatedAt:    now,
+		stateVersion: 1,
 	}
 	r.deck = deck.For(r.contentTier)
 	r.answerPile = r.deck.ShuffledAnswers()
 	r.promptPile = r.deck.ShuffledPrompts()
 	return r
+}
+
+// SetStateObserver registers a non-blocking persistence callback. The callback
+// receives an immutable copy while the room is locked, so it must not call back
+// into the room. The manager uses it only to enqueue background snapshots.
+func (r *Room) SetStateObserver(observer func(PersistedRoomState)) {
+	r.mu.Lock()
+	r.stateObserver = observer
+	r.mu.Unlock()
+}
+
+func (r *Room) PersistedState() PersistedRoomState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.persistedStateLocked()
+}
+
+// RestoreRoom rebuilds an active room from durable state. Connections are
+// deliberately not restored: browsers reconnect with their existing player id
+// and guest token after the process comes back.
+func RestoreRoom(state PersistedRoomState, deck cards.Deck) (*Room, error) {
+	if state.SchemaVersion != currentRoomStateVersion {
+		return nil, errors.New("unsupported room state version")
+	}
+	code := normalizeRoomCode(state.Code)
+	if code == "" {
+		return nil, errors.New("room state has no code")
+	}
+	tier := normalizeTier(state.ContentTier)
+	if tier == "" {
+		return nil, errors.New("room state has an invalid content tier")
+	}
+	if !validPhase(state.Phase) {
+		return nil, errors.New("room state has an invalid phase")
+	}
+
+	now := time.Now().UTC()
+	r := &Room{
+		code:          code,
+		fullDeck:      deck,
+		deck:          deck.For(tier),
+		phase:         state.Phase,
+		phaseSeq:      state.PhaseSeq,
+		phaseDeadline: state.PhaseDeadline,
+		roundNumber:   state.RoundNumber,
+		prompt:        clonePrompt(state.Prompt),
+		hostID:        state.HostID,
+		judgeID:       state.JudgeID,
+		judgeIndex:    state.JudgeIndex,
+		scoreLimit:    clampInt(state.ScoreLimit, minScoreLimit, maxScoreLimit, defaultScoreLimit),
+		submitSecs:    clampInt(state.SubmitSecs, minSubmitSecs, maxSubmitSecs, defaultSubmitSecs),
+		maxPlayers:    clampInt(state.MaxPlayers, minPlayersToStart, maxPlayersCeiling, defaultMaxPlayers),
+		contentTier:   tier,
+		players:       map[string]*Player{},
+		submissions:   map[string]Submission{},
+		answerPile:    append([]cards.AnswerCard(nil), state.AnswerPile...),
+		promptPile:    append([]cards.PromptCard(nil), state.PromptPile...),
+		clients:       map[string]map[*ws.Conn]bool{},
+		createdAt:     state.CreatedAt,
+		updatedAt:     state.UpdatedAt,
+		stateVersion:  state.Revision,
+	}
+	if r.phaseSeq < 1 {
+		r.phaseSeq = 1
+	}
+	if r.stateVersion < 1 {
+		r.stateVersion = 1
+	}
+	if r.createdAt.IsZero() {
+		r.createdAt = now
+	}
+	if r.updatedAt.IsZero() {
+		r.updatedAt = now
+	}
+
+	for _, persisted := range state.Players {
+		if persisted.ID == "" || persisted.GuestToken == "" {
+			return nil, errors.New("room state has an invalid player")
+		}
+		if _, exists := r.players[persisted.ID]; exists {
+			return nil, errors.New("room state has duplicate players")
+		}
+		r.players[persisted.ID] = &Player{
+			ID:         persisted.ID,
+			Name:       persisted.Name,
+			GuestToken: persisted.GuestToken,
+			Score:      persisted.Score,
+			Connected:  persisted.IsComputer,
+			IsComputer: persisted.IsComputer,
+			IsJudge:    persisted.IsJudge,
+			Hand:       append([]cards.AnswerCard(nil), persisted.Hand...),
+		}
+	}
+	r.order = append([]string(nil), state.Order...)
+	if len(r.order) != len(r.players) || len(r.order) > r.maxPlayers {
+		return nil, errors.New("room state has an invalid player order")
+	}
+	for _, id := range r.order {
+		if r.players[id] == nil {
+			return nil, errors.New("room state references an unknown player")
+		}
+	}
+	if r.hostID != "" && r.players[r.hostID] == nil {
+		return nil, errors.New("room state references an unknown host")
+	}
+	if r.judgeID != "" && r.players[r.judgeID] == nil {
+		return nil, errors.New("room state references an unknown judge")
+	}
+	for _, submission := range state.Submissions {
+		if submission.ID == "" || r.players[submission.PlayerID] == nil {
+			return nil, errors.New("room state has an invalid submission")
+		}
+		if _, exists := r.submissions[submission.ID]; exists {
+			return nil, errors.New("room state has duplicate submissions")
+		}
+		r.submissions[submission.ID] = submission
+	}
+	if len(r.answerPile) == 0 {
+		r.answerPile = r.deck.ShuffledAnswers()
+	}
+	if len(r.promptPile) == 0 {
+		r.promptPile = r.deck.ShuffledPrompts()
+	}
+	return r, nil
+}
+
+// Resume re-arms a persisted deadline once the manager has installed its
+// persistence observer. Expired phases advance immediately and are persisted
+// again by the normal room transition path.
+func (r *Room) Resume() {
+	r.mu.Lock()
+	r.scheduleComputerTurnsLocked()
+	if r.timer != nil || r.phaseDeadline.IsZero() {
+		r.mu.Unlock()
+		return
+	}
+	seq := r.phaseSeq
+	delay := time.Until(r.phaseDeadline)
+	if delay > 0 {
+		r.timer = time.AfterFunc(delay, func() { r.onDeadline(seq) })
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	go r.onDeadline(seq)
 }
 
 func (r *Room) Join(name string) Player {
@@ -114,11 +270,15 @@ func (r *Room) TryJoin(name string) (Player, error) {
 }
 
 func (r *Room) joinLocked(name string) Player {
+	return r.addPlayerLocked(name, false)
+}
+
+func (r *Room) addPlayerLocked(name string, isComputer bool) Player {
 	cleanName := clampName(strings.TrimSpace(name))
 	if cleanName == "" {
 		cleanName = "Guest"
 	}
-	p := Player{ID: newID("pl"), GuestToken: newSecret("gt"), Name: cleanName, Connected: false, Hand: r.drawAnswers(handSize)}
+	p := Player{ID: newID("pl"), GuestToken: newSecret("gt"), Name: cleanName, Connected: isComputer, IsComputer: isComputer, Hand: r.drawAnswers(handSize)}
 	r.players[p.ID] = &p
 	r.order = append(r.order, p.ID)
 	if r.hostID == "" {
@@ -126,6 +286,25 @@ func (r *Room) joinLocked(name string) Player {
 	}
 	r.touch()
 	return p
+}
+
+func (r *Room) addComputerPlayerLocked() Player {
+	return r.addPlayerLocked(r.nextComputerNameLocked(), true)
+}
+
+func (r *Room) nextComputerNameLocked() string {
+	used := map[string]bool{}
+	for _, id := range r.order {
+		if p := r.players[id]; p != nil {
+			used[p.Name] = true
+		}
+	}
+	for _, name := range computerNames {
+		if !used[name] {
+			return name
+		}
+	}
+	return "CPU Guest"
 }
 
 func (r *Room) Attach(playerID string, guestToken string, conn *ws.Conn) error {
@@ -140,8 +319,8 @@ func (r *Room) Attach(playerID string, guestToken string, conn *ws.Conn) error {
 		return errInvalidToken
 	}
 	p.Connected = true
-	if r.hostID == "" {
-		r.hostID = playerID
+	if r.hostID == "" || r.players[r.hostID] == nil || !r.players[r.hostID].Connected {
+		r.reassignHostLocked()
 	}
 	if r.clients[playerID] == nil {
 		r.clients[playerID] = map[*ws.Conn]bool{}
@@ -174,7 +353,7 @@ func (r *Room) Detach(playerID string, conn *ws.Conn) {
 
 func (r *Room) reassignHostLocked() {
 	for _, id := range r.order {
-		if p := r.players[id]; p != nil && p.Connected {
+		if p := r.players[id]; p != nil && p.Connected && !p.IsComputer {
 			r.hostID = id
 			return
 		}
@@ -198,13 +377,57 @@ func (r *Room) StartGame(playerID string) error {
 	}
 	r.judgeIndex = 0
 	r.beginRoundLocked()
+	r.scheduleComputerTurnsLocked()
 	return nil
+}
+
+// StartComputerGame fills the lobby with computer players and starts a normal
+// game loop. The first judge is a computer player so the human gets an answer
+// round before learning the judge role.
+func (r *Room) StartComputerGame(playerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if playerID != r.hostID {
+		return errNotHost
+	}
+	if r.phase != PhaseLobby {
+		return errors.New("game already in progress")
+	}
+	for len(r.order) < minPlayersToStart {
+		if len(r.order) >= r.maxPlayers {
+			return ErrRoomFull
+		}
+		r.addComputerPlayerLocked()
+	}
+	r.judgeIndex = r.firstComputerIndexLocked()
+	r.beginRoundLocked()
+	r.scheduleComputerTurnsLocked()
+	return nil
+}
+
+func (r *Room) firstComputerIndexLocked() int {
+	for i, id := range r.order {
+		if p := r.players[id]; p != nil && p.IsComputer {
+			return i
+		}
+	}
+	return 0
 }
 
 func (r *Room) SubmitAnswer(playerID, answerID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.submitAnswerLocked(playerID, answerID); err != nil {
+		return err
+	}
+	r.scheduleComputerTurnsLocked()
+	r.touch()
+	return nil
+}
+
+func (r *Room) submitAnswerLocked(playerID, answerID string) error {
 	if r.phase != PhaseSubmitting {
 		return errors.New("room is not accepting submissions")
 	}
@@ -239,7 +462,6 @@ func (r *Room) SubmitAnswer(playerID, answerID string) error {
 	if r.allAnswerersSubmitted() {
 		r.beginJudgingLocked()
 	}
-	r.touch()
 	return nil
 }
 
@@ -273,6 +495,7 @@ func (r *Room) NextRound(playerID string) error {
 	}
 	r.judgeIndex = (r.judgeIndex + 1) % len(r.order)
 	r.beginRoundLocked()
+	r.scheduleComputerTurnsLocked()
 	return nil
 }
 
@@ -314,6 +537,7 @@ func (r *Room) SkipPrompt(playerID string) error {
 	prompt := r.drawPrompt()
 	r.prompt = &prompt
 	r.setPhaseLocked(PhaseSubmitting, time.Duration(r.submitSecs)*time.Second)
+	r.scheduleComputerTurnsLocked()
 	r.touch()
 	return nil
 }
@@ -517,8 +741,74 @@ func (r *Room) onDeadline(seq int) {
 		r.mu.Unlock()
 		return
 	}
+	r.scheduleComputerTurnsLocked()
 	r.mu.Unlock()
 	r.Broadcast()
+}
+
+func (r *Room) scheduleComputerTurnsLocked() {
+	switch r.phase {
+	case PhaseSubmitting:
+		for _, id := range r.order {
+			p := r.players[id]
+			if p == nil || !p.IsComputer || id == r.judgeID || r.hasSubmissionLocked(id) || len(p.Hand) == 0 {
+				continue
+			}
+			playerID := id
+			phaseSeq := r.phaseSeq
+			delay := computerSubmitDelay + time.Duration(randInt(computerDelayJitter))*time.Millisecond
+			time.AfterFunc(delay, func() { r.submitComputerAnswer(playerID, phaseSeq) })
+		}
+	case PhaseJudging:
+		judge := r.players[r.judgeID]
+		if judge == nil || !judge.IsComputer || len(r.submissions) == 0 {
+			return
+		}
+		playerID := r.judgeID
+		phaseSeq := r.phaseSeq
+		delay := computerJudgeDelay + time.Duration(randInt(computerDelayJitter))*time.Millisecond
+		time.AfterFunc(delay, func() { r.pickComputerWinner(playerID, phaseSeq) })
+	}
+}
+
+func (r *Room) submitComputerAnswer(playerID string, phaseSeq int) {
+	r.mu.Lock()
+	p := r.players[playerID]
+	if r.phaseSeq != phaseSeq || r.phase != PhaseSubmitting || p == nil || !p.IsComputer || playerID == r.judgeID || r.hasSubmissionLocked(playerID) || len(p.Hand) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	cardID := p.Hand[randInt(len(p.Hand))].ID
+	if err := r.submitAnswerLocked(playerID, cardID); err != nil {
+		r.mu.Unlock()
+		return
+	}
+	r.scheduleComputerTurnsLocked()
+	r.touch()
+	r.mu.Unlock()
+	r.Broadcast()
+}
+
+func (r *Room) pickComputerWinner(playerID string, phaseSeq int) {
+	r.mu.Lock()
+	p := r.players[playerID]
+	if r.phaseSeq != phaseSeq || r.phase != PhaseJudging || r.judgeID != playerID || p == nil || !p.IsComputer || len(r.submissions) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	r.awardLocked(r.randomSubmissionID())
+	r.touch()
+	r.mu.Unlock()
+	r.Broadcast()
+}
+
+func (r *Room) hasSubmissionLocked(playerID string) bool {
+	for _, s := range r.submissions {
+		if s.PlayerID == playerID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Room) randomSubmissionID() string {
@@ -576,6 +866,16 @@ func (r *Room) Broadcast() {
 
 	for conn, snap := range recipients {
 		_ = conn.WriteJSON(ServerMessage{Type: "room_state", Room: snap})
+	}
+}
+
+func (r *Room) NotifyDraining() {
+	r.mu.Lock()
+	connections := r.connectionsLocked()
+	r.mu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.WriteJSON(ServerMessage{Type: "server_draining", Error: "server is restarting; reconnecting shortly"})
 	}
 }
 
@@ -645,17 +945,104 @@ func (r *Room) Evictable(cutoff time.Time) bool {
 	return len(r.clients) == 0 && r.updatedAt.Before(cutoff)
 }
 
-// Shutdown stops the room's deadline timer. Called when the manager evicts it.
-func (r *Room) Shutdown() {
+func (r *Room) ConnectedHumanPlayers() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	count := 0
+	for _, player := range r.players {
+		if player.Connected && !player.IsComputer {
+			count++
+		}
+	}
+	return count
+}
+
+// Shutdown stops the room's deadline timer and closes live connections. It is
+// called after the drain grace period and when a room loses its ownership lease.
+func (r *Room) Shutdown() {
+	r.mu.Lock()
+	r.stateObserver = nil
 	if r.timer != nil {
 		r.timer.Stop()
 		r.timer = nil
 	}
+	connections := r.connectionsLocked()
+	r.mu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 }
 
-func (r *Room) touch() { r.updatedAt = time.Now().UTC() }
+func (r *Room) connectionsLocked() []*ws.Conn {
+	connections := make([]*ws.Conn, 0)
+	for _, conns := range r.clients {
+		for conn := range conns {
+			connections = append(connections, conn)
+		}
+	}
+	return connections
+}
+
+func (r *Room) persistedStateLocked() PersistedRoomState {
+	players := make([]PersistedPlayer, 0, len(r.order))
+	for _, id := range r.order {
+		p := r.players[id]
+		if p == nil {
+			continue
+		}
+		players = append(players, PersistedPlayer{
+			ID:         p.ID,
+			Name:       p.Name,
+			GuestToken: p.GuestToken,
+			Score:      p.Score,
+			IsComputer: p.IsComputer,
+			IsJudge:    p.IsJudge,
+			Hand:       append([]cards.AnswerCard(nil), p.Hand...),
+		})
+	}
+	return PersistedRoomState{
+		SchemaVersion: currentRoomStateVersion,
+		Revision:      r.stateVersion,
+		Code:          r.code,
+		Phase:         r.phase,
+		PhaseSeq:      r.phaseSeq,
+		PhaseDeadline: r.phaseDeadline,
+		RoundNumber:   r.roundNumber,
+		Prompt:        clonePrompt(r.prompt),
+		HostID:        r.hostID,
+		JudgeID:       r.judgeID,
+		JudgeIndex:    r.judgeIndex,
+		ScoreLimit:    r.scoreLimit,
+		SubmitSecs:    r.submitSecs,
+		MaxPlayers:    r.maxPlayers,
+		ContentTier:   r.contentTier,
+		Players:       players,
+		Order:         append([]string(nil), r.order...),
+		Submissions:   sortedSubmissions(r.submissions),
+		AnswerPile:    append([]cards.AnswerCard(nil), r.answerPile...),
+		PromptPile:    append([]cards.PromptCard(nil), r.promptPile...),
+		CreatedAt:     r.createdAt,
+		UpdatedAt:     r.updatedAt,
+	}
+}
+
+func (r *Room) touch() {
+	r.updatedAt = time.Now().UTC()
+	r.stateVersion++
+	if r.stateObserver != nil {
+		r.stateObserver(r.persistedStateLocked())
+	}
+}
+
+func validPhase(phase Phase) bool {
+	switch phase {
+	case PhaseLobby, PhaseSubmitting, PhaseJudging, PhaseScoring, PhaseFinished:
+		return true
+	default:
+		return false
+	}
+}
 
 func clampName(s string) string {
 	if runes := []rune(s); len(runes) > maxNameLen {
@@ -666,13 +1053,17 @@ func clampName(s string) string {
 
 func newID(prefix string) string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("secure random source unavailable")
+	}
 	return prefix + "_" + hex.EncodeToString(b)
 }
 
 func newSecret(prefix string) string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("secure random source unavailable")
+	}
 	return prefix + "_" + hex.EncodeToString(b)
 }
 
@@ -687,6 +1078,9 @@ func randInt(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	x, _ := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	x, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		panic("secure random source unavailable")
+	}
 	return int(x.Int64())
 }

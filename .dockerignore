@@ -3,7 +3,6 @@
 **/.git
 **/*.log
 artifacts
-migrations
 docker-compose.yml
 *.md
 .DS_Store

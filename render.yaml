@@ -16,3 +16,13 @@ services:
         value: 20m
       - key: MAX_LOCAL_ROOMS
         value: 100
+      - key: SHUTDOWN_DRAIN_GRACE
+        value: 2s
+      - key: PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN
+        value: 20
+      - key: PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN
+        value: 80
+      - key: PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN
+        value: 120
+      - key: PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN
+        value: 240

@@ -27,12 +27,29 @@ type RoomRecord struct {
 
 type RoomRegistry interface {
 	ReserveRoom(ctx context.Context, code string, instanceID string, ttl time.Duration) error
+	ClaimRoom(ctx context.Context, code string, instanceID string, ttl time.Duration) error
 	LookupRoom(ctx context.Context, code string) (RoomRecord, error)
 	HeartbeatRoom(ctx context.Context, code string, instanceID string, ttl time.Duration) error
+	ReleaseRoom(ctx context.Context, code string, instanceID string) error
 	// Ping reports whether the registry's backing store is reachable. Used by
 	// the readiness probe.
 	Ping(ctx context.Context) error
 	RegistryName() string
+}
+
+// DatabaseStatsReporter is optional because the local memory registry has no
+// connection pool. Production Postgres registries implement it for `/metrics`.
+type DatabaseStatsReporter interface {
+	DatabaseStats() DatabaseStats
+}
+
+type DatabaseStats struct {
+	MaxOpenConnections int
+	OpenConnections    int
+	InUse              int
+	Idle               int
+	WaitCount          int64
+	WaitDuration       time.Duration
 }
 
 type RoomOwnedElsewhereError struct {
@@ -82,6 +99,10 @@ func (r *MemoryRoomRegistry) ReserveRoom(ctx context.Context, code string, insta
 	return nil
 }
 
+func (r *MemoryRoomRegistry) ClaimRoom(ctx context.Context, code string, instanceID string, ttl time.Duration) error {
+	return r.ReserveRoom(ctx, code, instanceID, ttl)
+}
+
 func (r *MemoryRoomRegistry) LookupRoom(ctx context.Context, code string) (RoomRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return RoomRecord{}, err
@@ -125,6 +146,28 @@ func (r *MemoryRoomRegistry) HeartbeatRoom(ctx context.Context, code string, ins
 	}
 	record.HeartbeatAt = now
 	record.ExpiresAt = now.Add(ttl)
+	record.UpdatedAt = now
+	r.rooms[code] = record
+	return nil
+}
+
+func (r *MemoryRoomRegistry) ReleaseRoom(ctx context.Context, code string, instanceID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	code = normalizeRoomCode(code)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.rooms[code]
+	if !ok {
+		return ErrRoomNotFound
+	}
+	if record.InstanceID != instanceID {
+		return &RoomOwnedElsewhereError{Code: code, InstanceID: record.InstanceID}
+	}
+	now := time.Now().UTC()
+	record.HeartbeatAt = now
+	record.ExpiresAt = now
 	record.UpdatedAt = now
 	r.rooms[code] = record
 	return nil
