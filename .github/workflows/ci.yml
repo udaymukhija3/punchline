@@ -12,10 +12,12 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: "1.25"
+          cache-dependency-path: backend/go.sum
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt -w ."; exit 1; }
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./...
@@ -27,8 +29,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -39,9 +41,9 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -63,11 +65,12 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
-      - uses: actions/setup-node@v4
+          go-version: "1.25"
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - run: go build -o /tmp/punchline-api ./cmd/api
@@ -79,11 +82,11 @@ jobs:
           export DATABASE_URL='postgres://punchline:punchline@localhost:5432/punchline?sslmode=disable'
           export PUNCHLINE_REQUIRE_DATABASE=true
           /tmp/punchline-migrate
-          (cd backend && go test ./internal/roomstore -run TestPostgresReleaseRetainsRoomState -count=1)
-          (cd backend && go test ./internal/daily -run TestPostgres -count=1)
-          (cd backend && go test ./internal/cards -run TestPostgres -count=1)
-          (cd backend && go test ./internal/content -run TestPostgres -count=1)
-          (cd backend && go test ./internal/telemetry -run TestPostgres -count=1)
+          (cd backend && go test -race ./internal/roomstore -run TestPostgresReleaseRetainsRoomState -count=1)
+          (cd backend && go test -race ./internal/daily -run TestPostgres -count=1)
+          (cd backend && go test -race ./internal/cards -run TestPostgres -count=1)
+          (cd backend && go test -race ./internal/content -run TestPostgres -count=1)
+          (cd backend && go test -race ./internal/telemetry -run TestPostgres -count=1)
           node scripts/generate-card-seed-migration.mjs
           git diff --exit-code migrations/005_seed_official_pack.sql
           export PUNCHLINE_ADMIN_TOKEN='ci-admin-token'

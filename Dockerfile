@@ -9,7 +9,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # 2) Build the Go server and migration runner (static binaries)
-FROM golang:1.24-alpine AS api
+FROM golang:1.25-alpine AS api
 WORKDIR /app
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
