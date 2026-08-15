@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/content"
 	"punchline/backend/internal/daily"
 	"punchline/backend/internal/httpapi"
 	"punchline/backend/internal/realtime"
 	"punchline/backend/internal/roomstore"
+	"punchline/backend/internal/telemetry"
 )
 
 func main() {
@@ -35,19 +37,20 @@ func main() {
 		log.Printf("ROOM_HEARTBEAT_INTERVAL must be below ROOM_LEASE_TTL; using %s", heartbeatInterval)
 	}
 
-	deckPath, err := cards.FindSeedDeckPath()
-	if err != nil {
-		log.Fatalf("find seed deck: %v", err)
-	}
-	deck, err := cards.LoadSeedDeck(deckPath)
-	if err != nil {
-		log.Fatalf("load seed deck %s: %v", deckPath, err)
-	}
 	registry, stateStore, db, cleanup := roomRegistry()
 	defer cleanup()
 
+	deck, deckSource := resolveDeck(ctx, db)
+	log.Printf("deck source=%s prompts=%d answers=%d", deckSource, len(deck.Prompts), len(deck.Answers))
+
+	// Card telemetry only means something for database-backed cards, which are
+	// the only ones with a row to count against.
+	cardTelemetry := telemetry.NewCardRecorder(db, getenvInt("CARD_TELEMETRY_BUFFER", 4096))
+	cardTelemetry.Start(ctx, getenvDuration("CARD_TELEMETRY_FLUSH_INTERVAL", 5*time.Second))
+
 	manager := realtime.NewRoomManager(
 		deck,
+		realtime.WithCardTelemetry(cardTelemetry),
 		realtime.WithInstanceID(instanceID),
 		realtime.WithRoomRegistry(registry),
 		realtime.WithRoomStateStore(stateStore),
@@ -63,8 +66,13 @@ func main() {
 	dailyService := daily.UnavailableService()
 	if db != nil {
 		dailyService = daily.NewService(db, deck)
+		dailyService.SetCardTelemetry(cardTelemetry)
 	}
 	handler := httpapi.NewHandler(manager, dailyService)
+	handler.SetCardTelemetry(cardTelemetry)
+	if db != nil {
+		handler.SetContentService(content.NewService(db))
+	}
 	handler.StartDailyWorker(ctx, getenvDuration("DAILY_WORKER_INTERVAL", time.Minute))
 
 	srv := &http.Server{
@@ -97,6 +105,49 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown error: %v", err)
 	}
+}
+
+// resolveDeck decides where cards come from. Postgres is authoritative once
+// migration 005 has seeded the official pack; the seed file remains the
+// fallback that keeps local dev and database-less deployments playable.
+// PUNCHLINE_DECK_SOURCE pins the choice instead of auto-detecting: "database"
+// refuses to start without a usable database deck, "seed" ignores the database.
+func resolveDeck(ctx context.Context, db *sql.DB) (cards.Deck, string) {
+	source := strings.ToLower(strings.TrimSpace(getenv("PUNCHLINE_DECK_SOURCE", "auto")))
+	switch source {
+	case "auto", "database", "seed":
+	default:
+		log.Fatalf("PUNCHLINE_DECK_SOURCE must be auto, database, or seed; got %q", source)
+	}
+
+	if source != "seed" {
+		if db == nil {
+			if source == "database" {
+				log.Fatal("PUNCHLINE_DECK_SOURCE=database requires DATABASE_URL")
+			}
+		} else {
+			loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			deck, err := cards.LoadDeckFromDB(loadCtx, db)
+			if err == nil {
+				return deck, "database"
+			}
+			if source == "database" {
+				log.Fatalf("load deck from database: %v", err)
+			}
+			log.Printf("deck: falling back to the seed file: %v", err)
+		}
+	}
+
+	deckPath, err := cards.FindSeedDeckPath()
+	if err != nil {
+		log.Fatalf("find seed deck: %v", err)
+	}
+	deck, err := cards.LoadSeedDeck(deckPath)
+	if err != nil {
+		log.Fatalf("load seed deck %s: %v", deckPath, err)
+	}
+	return deck, "seed " + deckPath
 }
 
 func getenv(key, fallback string) string {

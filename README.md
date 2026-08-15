@@ -50,16 +50,23 @@ What works today:
   row locks, and idempotent upserts prevent duplicate rounds and retry damage.
 - Generate a spoiler-safe daily result PNG that includes only the round number,
   winner name, and streak—not the submitted answers.
+- Serve cards from Postgres (`packs`, `prompt_cards`, `answer_cards`) with the
+  seed file as the authoring format and fallback.
+- Count how cards perform in play (played/won/skipped) through a non-blocking
+  buffered recorder, and surface those counts in the admin card browser.
+- Turn daily winners into candidate cards, deduped and vote-ranked, for an admin
+  to promote into the community pack. This is the content pipeline; there is no
+  AI generation step.
+- Let any player report a card mid-game, auto-retire a card at three distinct
+  reporters, and moderate the result from a token-gated `/admin` desk.
 
 What is not shipped yet:
 
 - Persistent accounts, user profiles, live match history, or durable live-game
   results. Daily group rounds and results are durable.
-- Runtime database-backed card/deck loading. The current game loads
-  `seed/cards.json` at startup; the SQL schema and planning docs include future
-  content tables.
-- Public content packs, moderation workflow, reporting UI, or AI-assisted card
-  generation.
+- Per-room pack selection (rooms draw from every approved pack), user accounts,
+  and therefore user-level bans — moderation acts on content, not people.
+- Push or email notifications for daily rounds.
 - Payments, app-store mobile clients, or a permanent hosted production URL in
   this repo.
 
@@ -87,6 +94,9 @@ Accurate bullets:
 - Built a transactional daily engine with timezone-aware rounds, multi-instance
   deadline workers, scoped guest authorization, anonymous voting, idempotent
   mutations, database invariants, streaks, and spoiler-safe sharing.
+- Shipped a database-backed content platform: card telemetry collected without
+  blocking the game loop, a player-sourced card pipeline fed by daily winners,
+  report-driven auto-retirement, and a token-gated moderation desk.
 
 Evidence map: `docs/RECRUITER_EVIDENCE.md`.
 
@@ -98,11 +108,13 @@ README:
 - Do not claim persistent live match history or zero-downtime recovery from every
   failure. Active rooms recover from Postgres snapshots after graceful release
   or lease expiry, while guest sessions remain browser-local.
-- Do not claim persistent accounts, live match history, durable live results,
-  or database-backed deck serving. Daily mode has durable group-scoped guest
-  memberships and results, not accounts.
-- Do not claim the moderation workflow, reporting UI, or AI-assisted content
-  pipeline is live. Those remain planning/backlog surfaces.
+- Do not claim persistent accounts, live match history, or durable live results.
+  Daily mode has durable group-scoped guest memberships and results, not
+  accounts. Card content is database-backed and is fine to claim.
+- Do not claim an AI content pipeline. Content comes from players via the daily
+  candidate queue; there is deliberately no generation step.
+- Do not claim user-level moderation or bans. Moderation acts on content only,
+  because there are no accounts to ban.
 - Do not infer shipped behavior only from `artifacts/`; verify against
   `backend/`, `frontend/`, tests, Docker, and the smoke script.
 
@@ -122,8 +134,10 @@ README:
 - Backend: Go 1.24, `net/http`, custom WebSocket implementation, in-memory room
   actors, and Postgres via `github.com/jackc/pgx/v5` for production durability.
 - Frontend: Vite, React 19, plain JavaScript, mobile-first responsive UI.
-- Data: `seed/cards.json` for prompt selection and live cards; Postgres for room
-  leases/snapshots and durable daily groups, rounds, submissions, votes/results.
+- Data: Postgres holds the card content (`packs`, `prompt_cards`,
+  `answer_cards`), room leases/snapshots, and durable daily groups, rounds,
+  submissions, and votes/results. `seed/cards.json` is the authoring format for
+  the launch deck and the fallback when no database is configured.
 - Runtime: multi-stage Docker image that builds the frontend and serves API,
   WebSockets, and static UI from one Go process.
 - Deployment target: Fly.io config is included, but any container host with
@@ -133,10 +147,10 @@ README:
 
 ```txt
 backend/     Go API, WebSocket transport, room manager, and game engine
-docs/        Recruiter-facing evidence map for shipped capabilities
+docs/        Deployment, daily engine, content platform, and evidence map
 frontend/    Vite + React client with reconnecting guest sessions
 migrations/  Postgres schema, including room ownership lease columns
-seed/        Prompt and answer card seed deck loaded by the server at startup
+seed/        Launch deck in authoring form; migration 005 loads it into Postgres
 scripts/     End-to-end live and daily smoke/deploy gates
 Dockerfile   Multi-stage API + UI production image
 fly.toml     Fly.io deployment config
@@ -216,7 +230,39 @@ ROOM_HEARTBEAT_INTERVAL     Lease heartbeat interval, default 15s.
 DB_MAX_OPEN_CONNS           Postgres pool cap, default 10.
 DB_MAX_IDLE_CONNS           Postgres idle pool cap, default 5.
 DAILY_WORKER_INTERVAL       Daily transition scan interval, default 1m.
+PUNCHLINE_DECK_SOURCE       auto (default), database, or seed. auto prefers
+                            Postgres and falls back to seed/cards.json.
+PUNCHLINE_ADMIN_TOKEN       Enables the /admin desk. Unset = desk returns 404.
+PUNCHLINE_REPORT_LIMIT_PER_MIN  Card reports per client per minute, default 20.
+CARD_TELEMETRY_FLUSH_INTERVAL   Card counter flush interval, default 5s.
 ```
+
+### Admin desk
+
+With `PUNCHLINE_ADMIN_TOKEN` set, `/admin` opens a moderation desk: the report
+queue, the candidate queue fed by daily winners, and a card browser sorted by
+play/win/skip telemetry. Unset the variable and every admin route 404s.
+
+See [docs/CONTENT_PLATFORM.md](docs/CONTENT_PLATFORM.md) for how cards enter the
+deck, earn their place, and get retired.
+
+### Where cards come from
+
+`seed/cards.json` is the authoring format for the launch deck. Migration
+`005_seed_official_pack.sql` loads it into `packs`/`prompt_cards`/`answer_cards`,
+after which the running process reads cards from Postgres and each card carries
+its database row id. The seed file stays as the fallback so local dev and
+database-less runs still work.
+
+The migration is generated, not hand-written. After editing `seed/cards.json`:
+
+```bash
+node scripts/generate-card-seed-migration.mjs
+```
+
+CI regenerates it and fails on drift. Once migration 005 has been applied
+anywhere, the runner rejects edits to it by checksum — later content changes
+belong in a new migration, or in the admin desk once that exists.
 
 ## Run the production image locally
 

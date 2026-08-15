@@ -26,16 +26,22 @@ const (
 	seedDeckPathEnvName = "PUNCHLINE_SEED_CARDS"
 )
 
+// PromptCard and AnswerCard carry two identities. ID is the stable content id
+// used by the engine, snapshots, and clients: it is the seed id for cards that
+// came from the launch deck. UUID is the database primary key, empty for cards
+// loaded from the seed file, and is what telemetry counts against.
 type PromptCard struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
 	Tier string `json:"tier"`
+	UUID string `json:"uuid,omitempty"`
 }
 
 type AnswerCard struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
 	Tier string `json:"tier"`
+	UUID string `json:"uuid,omitempty"`
 }
 
 type Deck struct {

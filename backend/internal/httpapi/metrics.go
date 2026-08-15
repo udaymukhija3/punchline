@@ -16,13 +16,18 @@ import (
 type metrics struct {
 	mu sync.Mutex
 
-	httpRequests           map[httpMetricKey]uint64
-	httpDuration           map[httpMetricKey]durationMetric
-	roomsCreated           map[string]uint64
-	wsMessages             map[wsMessageKey]uint64
-	actionErrors           map[string]uint64
-	rateLimited            map[string]uint64
-	dailyActions           map[wsMessageKey]uint64
+	httpRequests     map[httpMetricKey]uint64
+	httpDuration     map[httpMetricKey]durationMetric
+	roomsCreated     map[string]uint64
+	wsMessages       map[wsMessageKey]uint64
+	actionErrors     map[string]uint64
+	rateLimited      map[string]uint64
+	dailyActions     map[wsMessageKey]uint64
+	contentActions   map[wsMessageKey]uint64
+	cardsAutoRetired uint64
+	// telemetryStats reports card telemetry counters. Nil until a recorder is
+	// attached, which is the case for seed-backed decks.
+	telemetryStats         func() (flushed, dropped, failed int64)
 	dailyTransitions       map[string]uint64
 	dailyWorkerErrors      uint64
 	dailyWorkerLastSuccess float64
@@ -56,6 +61,7 @@ func newMetrics() *metrics {
 		actionErrors:     map[string]uint64{},
 		rateLimited:      map[string]uint64{},
 		dailyActions:     map[wsMessageKey]uint64{},
+		contentActions:   map[wsMessageKey]uint64{},
 		dailyTransitions: map[string]uint64{},
 	}
 }
@@ -70,6 +76,27 @@ func (m *metrics) recordDailyAction(action, result string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.dailyActions[wsMessageKey{Type: action, Result: result}]++
+}
+
+func (m *metrics) recordContentAction(action, result string) {
+	if action == "" {
+		action = "unknown"
+	}
+	if result == "" {
+		result = "ok"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.contentActions[wsMessageKey{Type: action, Result: result}]++
+}
+
+// recordCardAutoRetired counts cards pulled from rotation by player reports
+// alone. A sudden rise means either an abuse campaign or a genuinely bad batch
+// of content, and both are worth an alert.
+func (m *metrics) recordCardAutoRetired() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cardsAutoRetired++
 }
 
 func (m *metrics) recordDailyWorker(created, revealed, finalized int, err error) {
@@ -220,6 +247,24 @@ func (m *metrics) writePrometheus(w http.ResponseWriter, stats realtime.RoomMana
 	fmt.Fprintln(w, "# HELP punchline_daily_worker_last_success_unixtime Last successful daily worker execution.")
 	fmt.Fprintln(w, "# TYPE punchline_daily_worker_last_success_unixtime gauge")
 	fmt.Fprintf(w, "punchline_daily_worker_last_success_unixtime %.0f\n", m.dailyWorkerLastSuccess)
+
+	fmt.Fprintln(w, "# HELP punchline_content_actions_total Content platform actions by action and result.")
+	fmt.Fprintln(w, "# TYPE punchline_content_actions_total counter")
+	for _, key := range sortedWSKeys(m.contentActions) {
+		fmt.Fprintf(w, "punchline_content_actions_total{action=%q,result=%q} %d\n", key.Type, key.Result, m.contentActions[key])
+	}
+	fmt.Fprintln(w, "# HELP punchline_cards_auto_retired_total Cards retired automatically by player reports.")
+	fmt.Fprintln(w, "# TYPE punchline_cards_auto_retired_total counter")
+	fmt.Fprintf(w, "punchline_cards_auto_retired_total %d\n", m.cardsAutoRetired)
+	fmt.Fprintln(w, "# HELP punchline_card_telemetry_events_total Card telemetry events by outcome.")
+	fmt.Fprintln(w, "# TYPE punchline_card_telemetry_events_total counter")
+	var flushed, dropped, failed int64
+	if m.telemetryStats != nil {
+		flushed, dropped, failed = m.telemetryStats()
+	}
+	fmt.Fprintf(w, "punchline_card_telemetry_events_total{outcome=\"flushed\"} %d\n", flushed)
+	fmt.Fprintf(w, "punchline_card_telemetry_events_total{outcome=\"dropped\"} %d\n", dropped)
+	fmt.Fprintf(w, "punchline_card_telemetry_events_total{outcome=\"failed\"} %d\n", failed)
 
 	fmt.Fprintln(w, "# HELP punchline_rooms_local Rooms currently hosted by this instance.")
 	fmt.Fprintln(w, "# TYPE punchline_rooms_local gauge")

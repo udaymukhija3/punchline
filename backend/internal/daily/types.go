@@ -33,6 +33,14 @@ type JoinGroupInput struct {
 	PlayerName string `json:"player_name"`
 }
 
+// UpdateGroupInput uses pointers so an omitted field means "leave unchanged"
+// rather than "set to zero" — reveal_hour 0 is a legitimate midnight deadline.
+type UpdateGroupInput struct {
+	Name       *string `json:"name,omitempty"`
+	Timezone   *string `json:"timezone,omitempty"`
+	RevealHour *int    `json:"reveal_hour,omitempty"`
+}
+
 type Session struct {
 	Group      Group      `json:"group"`
 	Membership Membership `json:"membership"`

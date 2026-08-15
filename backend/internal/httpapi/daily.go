@@ -46,6 +46,25 @@ func (h *Handler) dailyGroups(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) dailyGroupByCode(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/daily/groups/"), "/")
 	parts := strings.Split(path, "/")
+	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodPatch {
+		if !h.allowRequest(w, r, "daily_action", h.dailyActionLimitPerMin) {
+			return
+		}
+		var input daily.UpdateGroupInput
+		if err := decodeDailyBody(w, r, &input); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid daily group update")
+			return
+		}
+		group, err := h.daily.UpdateGroup(r.Context(), strings.ToUpper(parts[0]), bearerToken(r), input)
+		if err != nil {
+			h.metrics.recordDailyAction("update_group", "error")
+			h.writeDailyError(w, err)
+			return
+		}
+		h.metrics.recordDailyAction("update_group", "ok")
+		writeJSON(w, http.StatusOK, group)
+		return
+	}
 	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodDelete {
 		if !h.allowRequest(w, r, "daily_action", h.dailyActionLimitPerMin) {
 			return

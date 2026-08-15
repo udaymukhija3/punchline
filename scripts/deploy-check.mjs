@@ -91,6 +91,9 @@ try {
     'punchline_daily_actions_total',
     'punchline_daily_worker_errors_total',
     'punchline_daily_worker_last_success_unixtime',
+    'punchline_content_actions_total',
+    'punchline_cards_auto_retired_total',
+    'punchline_card_telemetry_events_total',
   ]) {
     if (!metrics.text.includes(needle)) {
       throw new Error(`/metrics did not include ${needle}`);

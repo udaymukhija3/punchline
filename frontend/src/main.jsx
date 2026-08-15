@@ -55,6 +55,7 @@ function plural(n, word) {
 }
 
 function App() {
+  if (location.pathname.startsWith('/admin')) return <AdminApp />;
   return location.pathname.startsWith('/daily') ? <DailyApp /> : <LiveApp />;
 }
 
@@ -410,6 +411,7 @@ function Game({ room, me, status, error, send, onLeave }) {
               <div className="prompt-card">
                 <span className="prompt-label">Prompt</span>
                 <p>{room.prompt?.text}</p>
+                <ReportControl card={room.prompt} kind="prompt" roomCode={room.code} />
               </div>
               <div className="submissions">
                 {room.submissions?.map((s) => (
@@ -419,6 +421,7 @@ function Game({ room, me, status, error, send, onLeave }) {
                       <button className="btn small" onClick={() => send('pick_winner', { submission_id: s.id })}>Pick</button>
                     )}
                     {s.is_winner && s.player_name && <span className="by">{s.player_name} +1</span>}
+                    {room.phase !== 'submitting' && <ReportControl card={s.answer} kind="answer" roomCode={room.code} />}
                   </div>
                 ))}
                 {room.phase === 'submitting' && room.submissions?.length === 0 && <p className="muted">No answers in yet...</p>}
@@ -1023,6 +1026,350 @@ function wrapCanvasText(context, text, x, y, maxWidth, lineHeight) {
     else line = test;
   }
   context.fillText(line.trim(), x, y);
+}
+
+
+// --- Reporting -------------------------------------------------------------
+
+const REPORT_REASONS = [
+  ['offensive', 'Offensive'],
+  ['broken', 'Broken or confusing'],
+  ['unfunny', 'Just not funny'],
+  ['duplicate', 'Duplicate'],
+];
+
+// Cards only carry a uuid when they came from the database, so the control
+// hides itself for seed-backed decks rather than offering a dead button.
+function ReportControl({ card, kind, roomCode }) {
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState('');
+  if (!card?.uuid) return null;
+
+  async function report(reason) {
+    setState('sending');
+    try {
+      const res = await fetch('/api/cards/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ card_kind: kind, card_id: card.uuid, reason, detail: '', room_code: roomCode || '' }),
+      });
+      if (!res.ok) throw new Error('report failed');
+      setState('done');
+      setOpen(false);
+    } catch {
+      setState('failed');
+    }
+  }
+
+  if (state === 'done') return <span className="report-done" role="status">Reported. Thanks.</span>;
+  return (
+    <div className="report-control">
+      <button className="inline-button subtle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        {open ? 'Cancel' : 'Report card'}
+      </button>
+      {open && <div className="report-reasons">
+        {REPORT_REASONS.map(([value, label]) => (
+          <button key={value} className="btn small ghost" disabled={state === 'sending'} onClick={() => report(value)}>{label}</button>
+        ))}
+      </div>}
+      {state === 'failed' && <span className="err small">Could not send that report.</span>}
+    </div>
+  );
+}
+
+// --- Admin desk ------------------------------------------------------------
+
+const ADMIN_TOKEN_KEY = 'punchline.admin.token';
+
+async function adminRequest(path, { method = 'GET', token, body } = {}) {
+  const headers = { Authorization: `Bearer ${token}` };
+  if (body) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  if (res.status === 401) throw new Error('That admin token was rejected.');
+  if (res.status === 404) throw new Error('The admin desk is not enabled on this deployment.');
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(data.error || 'The admin request failed.');
+  return data;
+}
+
+function AdminApp() {
+  const [token, setToken] = useState(() => localStorage.getItem(ADMIN_TOKEN_KEY) || '');
+  const [authed, setAuthed] = useState(false);
+  const [overview, setOverview] = useState(null);
+  const [error, setError] = useState('');
+  const [tab, setTab] = useState('reports');
+
+  const refreshOverview = useCallback(async (activeToken) => {
+    const data = await adminRequest('/api/admin/overview', { token: activeToken });
+    setOverview(data);
+    setAuthed(true);
+  }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    refreshOverview(token).catch((err) => { setError(errorMessage(err, 'Could not load the admin desk.')); setAuthed(false); });
+  }, [token, refreshOverview]);
+
+  async function signIn(candidate) {
+    setError('');
+    try {
+      await refreshOverview(candidate);
+      localStorage.setItem(ADMIN_TOKEN_KEY, candidate);
+      setToken(candidate);
+    } catch (err) {
+      setError(errorMessage(err, 'Could not sign in.'));
+    }
+  }
+
+  function signOut() {
+    localStorage.removeItem(ADMIN_TOKEN_KEY);
+    setToken('');
+    setAuthed(false);
+    setOverview(null);
+  }
+
+  if (!authed) return <AdminSignIn onSignIn={signIn} error={error} initial={token} />;
+
+  return (
+    <main className="shell admin-shell">
+      <header className="daily-topbar">
+        <a className="logo daily-logo" href="/">Punchline</a>
+        <div className="daily-nav-actions">
+          <span className="admin-badge">Admin desk</span>
+          <button className="btn ghost small" onClick={signOut}>Sign out</button>
+        </div>
+      </header>
+
+      {overview && <section className="admin-stats">
+        <AdminStat label="Open reports" value={overview.open_reports} accent={overview.open_reports > 0} />
+        <AdminStat label="Pending candidates" value={overview.pending_candidates} accent={overview.pending_candidates > 0} />
+        <AdminStat label="Live prompts" value={overview.approved_prompts} />
+        <AdminStat label="Live answers" value={overview.approved_answers} />
+        <AdminStat label="Retired" value={overview.retired_cards} />
+        <AdminStat label="Promoted from daily" value={overview.community_promoted} />
+        <AdminStat label="Daily groups" value={overview.daily_groups} />
+        <AdminStat label="Active members (7d)" value={overview.active_daily_members} />
+      </section>}
+
+      <nav className="admin-tabs" role="tablist">
+        {[['reports', 'Reports'], ['candidates', 'Candidates'], ['cards', 'Cards']].map(([id, label]) => (
+          <button key={id} role="tab" aria-selected={tab === id}
+            className={`btn small ${tab === id ? 'primary' : 'ghost'}`} onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </nav>
+
+      {error && <p className="err banner" role="alert">{error}</p>}
+
+      {tab === 'reports' && <AdminReports token={token} onChanged={() => refreshOverview(token)} autoRetireAt={overview?.auto_retire_at} />}
+      {tab === 'candidates' && <AdminCandidates token={token} onChanged={() => refreshOverview(token)} />}
+      {tab === 'cards' && <AdminCards token={token} onChanged={() => refreshOverview(token)} />}
+    </main>
+  );
+}
+
+function AdminSignIn({ onSignIn, error, initial }) {
+  const [value, setValue] = useState(initial || '');
+  return (
+    <main className="shell admin-shell">
+      <section className="panel admin-signin">
+        <h1>Admin desk</h1>
+        <p className="muted">Enter the deployment's admin token. It stays in this browser.</p>
+        <label htmlFor="admin-token">Admin token</label>
+        <input id="admin-token" className="field" type="password" value={value} autoComplete="off"
+          onChange={(event) => setValue(event.target.value)} />
+        <button className="btn primary block" disabled={!value.trim()} onClick={() => onSignIn(value.trim())}>Open the desk</button>
+        {error && <p className="err" role="alert">{error}</p>}
+      </section>
+    </main>
+  );
+}
+
+function AdminStat({ label, value, accent = false }) {
+  return <div className={`admin-stat ${accent ? 'accent' : ''}`}><b>{value ?? '—'}</b><span>{label}</span></div>;
+}
+
+function useAdminList(path, token, deps = []) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    setBusy(true); setError('');
+    try { setData(await adminRequest(path, { token })); }
+    catch (err) { setError(errorMessage(err, 'Could not load that queue.')); }
+    finally { setBusy(false); }
+  }, [path, token]);
+  useEffect(() => { load(); }, [load, ...deps]);
+  return { data, error, busy, reload: load };
+}
+
+function AdminReports({ token, onChanged, autoRetireAt }) {
+  const { data, error, busy, reload } = useAdminList('/api/admin/reports?limit=100', token);
+  const [acting, setActing] = useState('');
+
+  async function resolve(report, resolution) {
+    setActing(report.card_id);
+    try {
+      await adminRequest('/api/admin/reports', {
+        method: 'POST', token,
+        body: { card_kind: report.card_kind, card_id: report.card_id, resolution },
+      });
+      await reload();
+      await onChanged();
+    } catch (err) {
+      alert(errorMessage(err, 'Could not resolve that report.'));
+    } finally { setActing(''); }
+  }
+
+  const reports = data?.reports || [];
+  return (
+    <section className="admin-queue">
+      <div className="admin-queue-head">
+        <h2>Open reports</h2>
+        <span className="muted small">Cards are retired automatically at {autoRetireAt ?? 3} distinct reporters.</span>
+      </div>
+      {error && <p className="err" role="alert">{error}</p>}
+      {busy && !data && <p className="muted">Loading…</p>}
+      {!busy && reports.length === 0 && <p className="muted">Nothing reported. The deck is behaving.</p>}
+      <div className="admin-rows">
+        {reports.map((report) => (
+          <article className="admin-row" key={report.id}>
+            <div className="admin-row-main">
+              <span className={`tag ${report.card_kind}`}>{report.card_kind}</span>
+              <p>{report.card_text}</p>
+              <small className="muted">
+                {report.reason}{report.detail ? ` — ${report.detail}` : ''} · {report.reports_for_card} reporter(s)
+                {report.room_code ? ` · room ${report.room_code}` : ''} · currently {report.card_status}
+              </small>
+            </div>
+            <div className="admin-row-actions">
+              <button className="btn small" disabled={acting === report.card_id} onClick={() => resolve(report, 'retired')}>Retire card</button>
+              <button className="btn small ghost" disabled={acting === report.card_id} onClick={() => resolve(report, 'dismissed')}>Dismiss</button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AdminCandidates({ token, onChanged }) {
+  const { data, error, busy, reload } = useAdminList('/api/admin/candidates?limit=100', token);
+  const [acting, setActing] = useState('');
+
+  async function review(candidate, decision, tier = 'party') {
+    setActing(candidate.id);
+    try {
+      await adminRequest('/api/admin/candidates', {
+        method: 'POST', token, body: { candidate_id: candidate.id, decision, tier },
+      });
+      await reload();
+      await onChanged();
+    } catch (err) {
+      alert(errorMessage(err, 'Could not review that candidate.'));
+    } finally { setActing(''); }
+  }
+
+  const candidates = data?.candidates || [];
+  return (
+    <section className="admin-queue">
+      <div className="admin-queue-head">
+        <h2>Candidates from daily play</h2>
+        <span className="muted small">Answers players wrote and voted for. Approving adds the card to the community pack.</span>
+      </div>
+      {error && <p className="err" role="alert">{error}</p>}
+      {busy && !data && <p className="muted">Loading…</p>}
+      {!busy && candidates.length === 0 && <p className="muted">No candidates waiting. They arrive as daily rounds finalize.</p>}
+      <div className="admin-rows">
+        {candidates.map((candidate) => (
+          <article className="admin-row" key={candidate.id}>
+            <div className="admin-row-main">
+              <p>{candidate.text}</p>
+              <small className="muted">{candidate.vote_count} votes · written by {candidate.author_name || 'unknown'}</small>
+            </div>
+            <div className="admin-row-actions">
+              <button className="btn small primary" disabled={acting === candidate.id} onClick={() => review(candidate, 'approved', 'party')}>Approve</button>
+              <button className="btn small" disabled={acting === candidate.id} onClick={() => review(candidate, 'approved', 'family')}>Approve as family</button>
+              <button className="btn small ghost" disabled={acting === candidate.id} onClick={() => review(candidate, 'rejected')}>Reject</button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AdminCards({ token, onChanged }) {
+  const [kind, setKind] = useState('answer');
+  const [sort, setSort] = useState('played');
+  const [status, setStatus] = useState('approved');
+  const path = `/api/admin/cards?kind=${kind}&sort=${sort}&status=${status}&limit=100`;
+  const { data, error, busy, reload } = useAdminList(path, token, [kind, sort, status]);
+  const [acting, setActing] = useState('');
+
+  async function setCardStatus(card, next) {
+    setActing(card.id);
+    try {
+      await adminRequest('/api/admin/cards', {
+        method: 'POST', token, body: { card_kind: card.kind, card_id: card.id, status: next },
+      });
+      await reload();
+      await onChanged();
+    } catch (err) {
+      alert(errorMessage(err, 'Could not update that card.'));
+    } finally { setActing(''); }
+  }
+
+  const cards = data?.cards || [];
+  const rate = (card) => (card.kind === 'answer'
+    ? `${Math.round((card.win_rate || 0) * 100)}% win`
+    : `${Math.round((card.skip_rate || 0) * 100)}% skip`);
+
+  return (
+    <section className="admin-queue">
+      <div className="admin-queue-head">
+        <h2>Cards</h2>
+        <div className="admin-filters">
+          <select className="field small" value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Card kind">
+            <option value="answer">Answers</option>
+            <option value="prompt">Prompts</option>
+          </select>
+          <select className="field small" value={sort} onChange={(e) => setSort(e.target.value)} aria-label="Sort by">
+            <option value="played">Most played</option>
+            <option value="unplayed">Least played</option>
+            <option value="winning">{kind === 'answer' ? 'Most wins' : 'Most skipped'}</option>
+            <option value="skipped">Most skipped</option>
+            <option value="reported">Most reported</option>
+          </select>
+          <select className="field small" value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Status">
+            <option value="approved">Live</option>
+            <option value="retired">Retired</option>
+          </select>
+        </div>
+      </div>
+      {error && <p className="err" role="alert">{error}</p>}
+      {busy && !data && <p className="muted">Loading…</p>}
+      {!busy && cards.length === 0 && <p className="muted">No cards match that filter.</p>}
+      <div className="admin-rows">
+        {cards.map((card) => (
+          <article className="admin-row" key={card.id}>
+            <div className="admin-row-main">
+              <p>{card.text}</p>
+              <small className="muted">
+                {card.pack} · {card.tier} · played {card.times_played}× · {rate(card)}
+                {card.report_count > 0 ? ` · ${card.report_count} report(s)` : ''}
+              </small>
+            </div>
+            <div className="admin-row-actions">
+              {card.status === 'approved'
+                ? <button className="btn small" disabled={acting === card.id} onClick={() => setCardStatus(card, 'retired')}>Retire</button>
+                : <button className="btn small primary" disabled={acting === card.id} onClick={() => setCardStatus(card, 'approved')}>Restore</button>}
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 createRoot(document.getElementById('root')).render(<App />);

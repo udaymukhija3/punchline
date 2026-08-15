@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"punchline/backend/internal/content"
 	"punchline/backend/internal/daily"
 	"punchline/backend/internal/realtime"
+	"punchline/backend/internal/telemetry"
 	"punchline/backend/internal/ws"
 )
 
@@ -24,6 +26,9 @@ const maxJoinBody = 4 << 10
 type Handler struct {
 	manager                *realtime.RoomManager
 	daily                  *daily.Service
+	content                *content.Service
+	adminToken             string
+	reportLimitPerMin      int
 	allowedOrigins         map[string]bool
 	metrics                *metrics
 	metricsToken           string
@@ -48,6 +53,9 @@ func NewHandler(manager *realtime.RoomManager, dailyServices ...*daily.Service) 
 	return &Handler{
 		manager:                manager,
 		daily:                  dailyService,
+		content:                content.NewService(nil),
+		adminToken:             strings.TrimSpace(os.Getenv("PUNCHLINE_ADMIN_TOKEN")),
+		reportLimitPerMin:      getenvLimit("PUNCHLINE_REPORT_LIMIT_PER_MIN", 20),
 		allowedOrigins:         parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
 		metrics:                newMetrics(),
 		metricsToken:           strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
@@ -63,6 +71,22 @@ func NewHandler(manager *realtime.RoomManager, dailyServices ...*daily.Service) 
 	}
 }
 
+// SetCardTelemetry exposes card telemetry counters on the metrics endpoint.
+func (h *Handler) SetCardTelemetry(recorder *telemetry.CardRecorder) {
+	if recorder == nil {
+		return
+	}
+	h.metrics.telemetryStats = recorder.Stats
+}
+
+// SetContentService enables the reporting endpoint and the admin desk. Without
+// it the handler keeps a database-less content service, which fails closed.
+func (h *Handler) SetContentService(service *content.Service) {
+	if service != nil {
+		h.content = service
+	}
+}
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.health)
@@ -74,6 +98,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/api/daily/groups", h.dailyGroups)
 	mux.HandleFunc("/api/daily/groups/", h.dailyGroupByCode)
 	mux.HandleFunc("/api/daily/rounds/", h.dailyRoundAction)
+	mux.HandleFunc("/api/cards/report", h.cardReport)
+	mux.HandleFunc("/api/admin/overview", h.adminOverview)
+	mux.HandleFunc("/api/admin/reports", h.adminReports)
+	mux.HandleFunc("/api/admin/candidates", h.adminCandidates)
+	mux.HandleFunc("/api/admin/cards", h.adminCards)
+	mux.HandleFunc("/api/admin/daily-submissions/", h.adminDailySubmission)
 	mux.HandleFunc("/ws/rooms/", h.wsRoom)
 	if dir := staticDir(); dir != "" {
 		mux.Handle("/", spaHandler(dir))
@@ -396,7 +426,7 @@ func (h *Handler) cors(next http.Handler) http.Handler {
 			} else {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-				w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
 			}
 		}
 		if r.Method == http.MethodOptions {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -191,4 +192,187 @@ func TestPostgresDailyLifecyclePrivacyIdempotencyAndConcurrentWorker(t *testing.
 		t.Fatal(err)
 	}
 	deleted = true
+}
+
+func TestNormalizeCandidateTextCollapsesVariants(t *testing.T) {
+	same := []string{"A spreadsheet, with feelings!", "a  spreadsheet with feelings", "A SPREADSHEET WITH FEELINGS..."}
+	first := NormalizeCandidateText(same[0])
+	for _, variant := range same[1:] {
+		if got := NormalizeCandidateText(variant); got != first {
+			t.Fatalf("normalize(%q) = %q, want %q", variant, got, first)
+		}
+	}
+	if NormalizeCandidateText("!!!") != "" {
+		t.Fatal("punctuation-only text should normalize to empty")
+	}
+}
+
+// Finalizing a round harvests the answers the group voted for. This is the
+// content pipeline: without it there is no source of new cards.
+func TestPostgresFinalizationHarvestsCandidates(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is not configured")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	service := NewService(db, cards.NewSeedDeck())
+	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+
+	host, err := service.CreateGroup(ctx, CreateGroupInput{Name: "Harvest Crew", PlayerName: "Host", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ExecContext(context.Background(), `DELETE FROM daily_groups WHERE id = $1::uuid`, host.Group.ID)
+
+	members := []Session{host}
+	for _, name := range []string{"Bea", "Cy", "Dev"} {
+		member, err := service.JoinGroup(ctx, host.Group.Code, JoinGroupInput{PlayerName: name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		members = append(members, member)
+	}
+
+	view, err := service.Today(ctx, host.Group.Code, host.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundID := view.Today.ID
+	winningText := fmt.Sprintf("The winning line %d", now.UnixNano())
+	answers := []string{winningText, "second place line", "third place line", "fourth place line"}
+	for i, member := range members {
+		if err := service.Submit(ctx, roundID, member.Token, answers[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now = time.Date(2026, 9, 3, 19, 0, 0, 0, time.UTC)
+	if _, err := service.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	voting, err := service.Today(ctx, host.Group.Code, host.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hostSubmissionID string
+	for _, submission := range voting.Today.Submissions {
+		if submission.Mine {
+			hostSubmissionID = submission.ID
+		}
+	}
+	// Three of the four vote for the host's answer; the host votes elsewhere.
+	for _, member := range members[1:] {
+		if err := service.Vote(ctx, roundID, member.Token, hostSubmissionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now = time.Date(2026, 9, 4, 14, 0, 0, 0, time.UTC)
+	if _, err := service.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var candidateText string
+	var voteCount int
+	var status string
+	err = db.QueryRowContext(ctx, `
+		SELECT text, vote_count, status::text FROM card_candidates
+		WHERE normalized_text = $1`, NormalizeCandidateText(winningText)).Scan(&candidateText, &voteCount, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("the winning answer did not become a candidate")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidateText != winningText || voteCount != 3 || status != "pending" {
+		t.Fatalf("candidate = %q/%d/%s", candidateText, voteCount, status)
+	}
+
+	// Answers nobody voted for must not enter the queue.
+	var unvoted int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM card_candidates WHERE normalized_text = $1`,
+		NormalizeCandidateText("fourth place line")).Scan(&unvoted); err != nil {
+		t.Fatal(err)
+	}
+	if unvoted != 0 {
+		t.Fatal("an answer with no votes became a candidate")
+	}
+
+	// Deleting the group withdraws its un-promoted candidates.
+	if err := service.DeleteGroup(ctx, host.Group.Code, host.Token); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM card_candidates WHERE normalized_text = $1`,
+		NormalizeCandidateText(winningText)).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatal("deleting a group left its pending candidates behind")
+	}
+}
+
+// Only one instance should scan for due transitions. Holding the advisory lock
+// elsewhere must make Tick a no-op rather than an error or a duplicate scan.
+func TestPostgresTickYieldsWhenAnotherInstanceHoldsTheLock(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is not configured")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	service := NewService(db, cards.NewSeedDeck())
+	host, err := service.CreateGroup(ctx, CreateGroupInput{Name: "Lock Crew", PlayerName: "Host", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ExecContext(context.Background(), `DELETE FROM daily_groups WHERE id = $1::uuid`, host.Group.ID)
+
+	// Stand in for another instance mid-tick.
+	holder, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	var acquired bool
+	if err := holder.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, tickAdvisoryLock).Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("could not acquire the tick lock for the test")
+	}
+
+	result, err := service.Tick(ctx)
+	if err != nil {
+		t.Fatalf("a yielding tick must not error: %v", err)
+	}
+	if result != (TickResult{}) {
+		t.Fatalf("a yielding tick did work anyway: %+v", result)
+	}
+
+	if _, err := holder.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, tickAdvisoryLock); err != nil {
+		t.Fatal(err)
+	}
+	// With the lock free the next tick proceeds normally.
+	if _, err := service.Tick(ctx); err != nil {
+		t.Fatalf("tick after release: %v", err)
+	}
 }

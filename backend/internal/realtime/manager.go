@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/telemetry"
 )
 
 const (
@@ -31,6 +32,7 @@ var ErrDraining = errors.New("instance is draining")
 type RoomManager struct {
 	mu            sync.RWMutex
 	deck          cards.Deck
+	cardTelemetry telemetry.Recorder
 	rooms         map[string]*Room
 	registry      RoomRegistry
 	stateStore    RoomStateStore
@@ -98,6 +100,14 @@ func WithRoomIdleTTL(ttl time.Duration) RoomManagerOption {
 		if ttl > 0 {
 			m.roomIdleTTL = ttl
 		}
+	}
+}
+
+// WithCardTelemetry records how cards perform in live rooms. Optional: without
+// it, rooms simply do not report card statistics.
+func WithCardTelemetry(recorder telemetry.Recorder) RoomManagerOption {
+	return func(m *RoomManager) {
+		m.cardTelemetry = recorder
 	}
 }
 
@@ -176,6 +186,7 @@ func (m *RoomManager) CreateRoom(ctx context.Context) (*Room, error) {
 			continue // lost a local race for this code; try another
 		}
 		room := NewRoom(code, m.deck)
+		room.SetCardTelemetry(m.cardTelemetry)
 		room.SetStateObserver(m.enqueueRoomState)
 		m.rooms[code] = room
 		m.mu.Unlock()
@@ -279,6 +290,7 @@ func (m *RoomManager) installRestoredRoom(code string, state PersistedRoomState)
 	if room.code != code {
 		return nil, errors.New("room state code does not match reservation")
 	}
+	room.SetCardTelemetry(m.cardTelemetry)
 	room.SetStateObserver(m.enqueueRoomState)
 
 	m.mu.Lock()

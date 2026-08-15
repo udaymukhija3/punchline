@@ -17,14 +17,32 @@ import (
 	"unicode/utf8"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/telemetry"
 )
 
 const groupCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 
+const (
+	// defaultRevealHour is the local hour a new group reveals at until its
+	// owner changes it.
+	defaultRevealHour = 18
+	// votingWindow is how long voting stays open after the reveal.
+	votingWindow = 18 * time.Hour
+)
+
 type Service struct {
-	db      *sql.DB
-	prompts []cards.PromptCard
-	now     func() time.Time
+	db        *sql.DB
+	prompts   []cards.PromptCard
+	now       func() time.Time
+	telemetry telemetry.Recorder
+}
+
+// SetCardTelemetry attaches a card telemetry recorder. A daily round "plays"
+// its prompt once, counted when the round is durably created.
+func (s *Service) SetCardTelemetry(recorder telemetry.Recorder) {
+	if s != nil {
+		s.telemetry = recorder
+	}
 }
 
 func NewService(db *sql.DB, deck cards.Deck) *Service {
@@ -104,14 +122,18 @@ func (s *Service) CreateGroup(ctx context.Context, input CreateGroupInput) (Sess
 		VALUES ($1::uuid, $2::uuid, $3, $4, 'owner')`, membershipID, groupID, playerName, tokenHash); err != nil {
 		return Session{}, fmt.Errorf("insert daily owner: %w", err)
 	}
-	if _, err := s.ensureRoundTx(ctx, tx, groupID, location.String(), 18, s.now().UTC()); err != nil {
+	_, firstPrompt, err := s.ensureRoundTx(ctx, tx, groupID, location.String(), defaultRevealHour, s.now().UTC())
+	if err != nil {
 		return Session{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Session{}, fmt.Errorf("commit daily group: %w", err)
 	}
+	if s.telemetry != nil {
+		s.telemetry.PromptPlayed(firstPrompt.UUID)
+	}
 	return Session{
-		Group:      Group{ID: groupID, Code: code, Name: groupName, Timezone: location.String(), RevealHour: 18, MemberCount: 1},
+		Group:      Group{ID: groupID, Code: code, Name: groupName, Timezone: location.String(), RevealHour: defaultRevealHour, MemberCount: 1},
 		Membership: Membership{ID: membershipID, DisplayName: playerName, Role: "owner"},
 		Token:      token,
 	}, nil
@@ -199,6 +221,88 @@ func (s *Service) DeleteGroup(ctx context.Context, code, token string) error {
 		return ErrUnauthorized
 	}
 	return nil
+}
+
+// UpdateGroup lets the owner move the group's daily deadline. Changing the
+// reveal hour or timezone reshapes today's round if it is still open; rounds
+// that have already revealed are left alone, because players have seen them.
+func (s *Service) UpdateGroup(ctx context.Context, code, token string, input UpdateGroupInput) (Group, error) {
+	if !s.Available() {
+		return Group{}, ErrUnavailable
+	}
+	member, group, err := s.authorizeGroup(ctx, normalizeCode(code), token)
+	if err != nil {
+		return Group{}, err
+	}
+	if member.Role != "owner" {
+		return Group{}, ErrUnauthorized
+	}
+
+	revealHour := group.RevealHour
+	if input.RevealHour != nil {
+		revealHour = *input.RevealHour
+		if revealHour < 0 || revealHour > 23 {
+			return Group{}, ErrInvalidInput
+		}
+	}
+	timezone := group.Timezone
+	if input.Timezone != nil {
+		candidate := strings.TrimSpace(*input.Timezone)
+		if candidate == "" {
+			return Group{}, ErrInvalidInput
+		}
+		loc, err := time.LoadLocation(candidate)
+		if err != nil {
+			return Group{}, ErrInvalidInput
+		}
+		timezone = loc.String()
+	}
+	name := group.Name
+	if input.Name != nil {
+		validated, err := validateName(*input.Name, 2, 40)
+		if err != nil {
+			return Group{}, ErrInvalidInput
+		}
+		name = validated
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Group{}, fmt.Errorf("begin daily group update: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE daily_groups SET name = $2, timezone = $3, reveal_hour = $4, updated_at = now()
+		WHERE id = $1::uuid`, group.ID, name, timezone, revealHour); err != nil {
+		return Group{}, fmt.Errorf("update daily group: %w", err)
+	}
+
+	// Re-time today's round so the change takes effect immediately rather than
+	// tomorrow. Only while submissions are still open.
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		return Group{}, fmt.Errorf("load updated timezone: %w", err)
+	}
+	localNow := s.now().UTC().In(loc)
+	revealAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), revealHour, 0, 0, 0, loc)
+	opensAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
+	if !revealAt.After(opensAt) {
+		revealAt = opensAt.Add(time.Hour)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE daily_rounds
+		SET reveal_at = $2, voting_closes_at = $3, updated_at = now()
+		WHERE group_id = $1::uuid AND state = 'OPEN_FOR_SUBMISSIONS' AND round_date = $4::date`,
+		group.ID, revealAt.UTC(), revealAt.Add(votingWindow).UTC(), localNow.Format("2006-01-02")); err != nil {
+		return Group{}, fmt.Errorf("retime open daily round: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Group{}, fmt.Errorf("commit daily group update: %w", err)
+	}
+
+	group.Name, group.Timezone, group.RevealHour = name, timezone, revealHour
+	return group, nil
 }
 
 func (s *Service) Today(ctx context.Context, code, token string) (TodayView, error) {
@@ -336,10 +440,35 @@ func (s *Service) Vote(ctx context.Context, roundID, token, submissionID string)
 	return nil
 }
 
+// tickAdvisoryLock is the Postgres advisory lock id that keeps daily
+// transitions to one instance at a time. The transitions are already
+// idempotent, so this is about not doing the same scan on every machine (and
+// not counting it three times in metrics), not about correctness.
+const tickAdvisoryLock = 0x50554e43 // "PUNC"
+
 func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 	if !s.Available() {
 		return TickResult{}, ErrUnavailable
 	}
+
+	// Try to become the ticking instance. Whoever loses simply skips this
+	// round; the winner's work covers every group.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return TickResult{}, fmt.Errorf("acquire daily tick connection: %w", err)
+	}
+	defer conn.Close()
+	var acquired bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, tickAdvisoryLock).Scan(&acquired); err != nil {
+		return TickResult{}, fmt.Errorf("acquire daily tick lock: %w", err)
+	}
+	if !acquired {
+		return TickResult{}, nil
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, tickAdvisoryLock)
+	}()
+
 	now := s.now().UTC()
 	rows, err := s.db.QueryContext(ctx, `SELECT id::text, timezone, reveal_hour FROM daily_groups ORDER BY id`)
 	if err != nil {
@@ -413,40 +542,44 @@ func (s *Service) ensureRound(ctx context.Context, groupID, timezone string, rev
 		return false, fmt.Errorf("begin daily round ensure: %w", err)
 	}
 	defer tx.Rollback()
-	created, err := s.ensureRoundTx(ctx, tx, groupID, timezone, revealHour, now)
+	created, prompt, err := s.ensureRoundTx(ctx, tx, groupID, timezone, revealHour, now)
 	if err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit daily round ensure: %w", err)
 	}
+	// Counted only after commit, so a rolled-back round never inflates a card.
+	if created && s.telemetry != nil {
+		s.telemetry.PromptPlayed(prompt.UUID)
+	}
 	return created, nil
 }
 
-func (s *Service) ensureRoundTx(ctx context.Context, tx *sql.Tx, groupID, timezone string, revealHour int, now time.Time) (bool, error) {
+func (s *Service) ensureRoundTx(ctx context.Context, tx *sql.Tx, groupID, timezone string, revealHour int, now time.Time) (bool, cards.PromptCard, error) {
 	if _, err := tx.ExecContext(ctx, `SELECT id FROM daily_groups WHERE id = $1::uuid FOR UPDATE`, groupID); err != nil {
-		return false, fmt.Errorf("lock daily group: %w", err)
+		return false, cards.PromptCard{}, fmt.Errorf("lock daily group: %w", err)
 	}
 	loc, err := time.LoadLocation(timezone)
 	if err != nil {
-		return false, fmt.Errorf("load daily group timezone: %w", err)
+		return false, cards.PromptCard{}, fmt.Errorf("load daily group timezone: %w", err)
 	}
 	localNow := now.In(loc)
 	date := localNow.Format("2006-01-02")
 	var exists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM daily_rounds WHERE group_id = $1::uuid AND round_date = $2::date)`, groupID, date).Scan(&exists); err != nil {
-		return false, fmt.Errorf("check daily round: %w", err)
+		return false, cards.PromptCard{}, fmt.Errorf("check daily round: %w", err)
 	}
 	if exists {
-		return false, nil
+		return false, cards.PromptCard{}, nil
 	}
 	var number int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(round_number), 0) + 1 FROM daily_rounds WHERE group_id = $1::uuid`, groupID).Scan(&number); err != nil {
-		return false, fmt.Errorf("number daily round: %w", err)
+		return false, cards.PromptCard{}, fmt.Errorf("number daily round: %w", err)
 	}
 	roundID, err := randomUUID()
 	if err != nil {
-		return false, err
+		return false, cards.PromptCard{}, err
 	}
 	prompt := s.promptFor(groupID, date)
 	opensAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
@@ -454,16 +587,16 @@ func (s *Service) ensureRoundTx(ctx context.Context, tx *sql.Tx, groupID, timezo
 	if !revealAt.After(opensAt) {
 		revealAt = opensAt.Add(time.Hour)
 	}
-	votingClosesAt := revealAt.Add(18 * time.Hour)
+	votingClosesAt := revealAt.Add(votingWindow)
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO daily_rounds
 		(id, group_id, round_number, round_date, prompt_key, prompt_text, opens_at, reveal_at, voting_closes_at)
 		VALUES ($1::uuid, $2::uuid, $3, $4::date, $5, $6, $7, $8, $9)`,
 		roundID, groupID, number, date, prompt.ID, prompt.Text, opensAt.UTC(), revealAt.UTC(), votingClosesAt.UTC())
 	if err != nil {
-		return false, fmt.Errorf("insert daily round: %w", err)
+		return false, cards.PromptCard{}, fmt.Errorf("insert daily round: %w", err)
 	}
-	return true, nil
+	return true, prompt, nil
 }
 
 func (s *Service) advanceDue(ctx context.Context, groupID string, now time.Time) (int, int, error) {
@@ -479,15 +612,12 @@ func (s *Service) advanceDue(ctx context.Context, groupID string, now time.Time)
 	if err != nil {
 		return 0, 0, fmt.Errorf("reveal due daily rounds: %w", err)
 	}
-	finalResult, err := s.db.ExecContext(ctx, `
-		UPDATE daily_rounds SET state = 'FINALIZED', finalized_at = $1, updated_at = now()
-		WHERE state = 'REVEALED_FOR_VOTING' AND voting_closes_at <= $1`+groupClause, args...)
+	finalized, err := s.finalizeRounds(ctx, groupClause, args)
 	if err != nil {
-		return 0, 0, fmt.Errorf("finalize due daily rounds: %w", err)
+		return 0, 0, err
 	}
 	revealed, _ := revealResult.RowsAffected()
-	finalized, _ := finalResult.RowsAffected()
-	return int(revealed), int(finalized), nil
+	return int(revealed), finalized, nil
 }
 
 func (s *Service) authorizeGroup(ctx context.Context, code, token string) (Membership, Group, error) {

@@ -30,6 +30,8 @@ services:
       PUNCHLINE_REQUIRE_DATABASE: "true"
       PUNCHLINE_ALLOWED_ORIGINS: http://localhost:8080
       DAILY_WORKER_INTERVAL: 5s
+      CARD_TELEMETRY_FLUSH_INTERVAL: 2s
+      PUNCHLINE_ADMIN_TOKEN: local-admin-token
     ports:
       - "8080:8080"
     depends_on:

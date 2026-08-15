@@ -87,7 +87,9 @@ intervals or when its error counter rises.
 - Membership tokens are browser-local and cannot be recovered on another
   device.
 - There are no push/email notifications yet.
-- The prompt catalog still comes from `seed/cards.json`; the chosen prompt is
-  durably snapshotted into each round.
+- The prompt catalog comes from whichever deck the process loaded at startup
+  (Postgres when available, otherwise `seed/cards.json`); the chosen prompt text
+  is durably snapshotted into each round, so retiring a card never rewrites
+  history.
 - Group owners can delete the group and all rounds. There is not yet an owner
   transfer or per-member leave API.

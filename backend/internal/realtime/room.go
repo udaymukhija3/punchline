@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/telemetry"
 	"punchline/backend/internal/ws"
 )
 
@@ -76,6 +77,43 @@ type Room struct {
 	updatedAt     time.Time
 	stateVersion  uint64
 	stateObserver func(PersistedRoomState)
+	// telemetry counts card performance. Calls are non-blocking, so they are
+	// safe to make while the room lock is held.
+	telemetry telemetry.Recorder
+}
+
+// SetCardTelemetry attaches a card telemetry recorder. Safe to leave unset: a
+// nil recorder discards everything, which is what a seed-backed deck wants.
+func (r *Room) SetCardTelemetry(recorder telemetry.Recorder) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.telemetry = recorder
+}
+
+// recordPrompt and recordAnswer centralise the nil check so the transition code
+// below stays readable.
+func (r *Room) recordPromptLocked(metric string, card *cards.PromptCard) {
+	if r.telemetry == nil || card == nil {
+		return
+	}
+	switch metric {
+	case telemetry.MetricPlayed:
+		r.telemetry.PromptPlayed(card.UUID)
+	case telemetry.MetricSkipped:
+		r.telemetry.PromptSkipped(card.UUID)
+	}
+}
+
+func (r *Room) recordAnswerLocked(metric string, card cards.AnswerCard) {
+	if r.telemetry == nil {
+		return
+	}
+	switch metric {
+	case telemetry.MetricPlayed:
+		r.telemetry.AnswerPlayed(card.UUID)
+	case telemetry.MetricWon:
+		r.telemetry.AnswerWon(card.UUID)
+	}
 }
 
 func NewRoom(code string, deck cards.Deck) *Room {
@@ -458,6 +496,7 @@ func (r *Room) submitAnswerLocked(playerID, answerID string) error {
 	p.Hand = append(p.Hand[:idx], p.Hand[idx+1:]...)
 	sub := Submission{ID: newID("sub"), PlayerID: playerID, PlayerName: p.Name, Answer: answer, SubmittedAt: time.Now().UTC()}
 	r.submissions[sub.ID] = sub
+	r.recordAnswerLocked(telemetry.MetricPlayed, answer)
 
 	if r.allAnswerersSubmitted() {
 		r.beginJudgingLocked()
@@ -534,8 +573,10 @@ func (r *Room) SkipPrompt(playerID string) error {
 		}
 	}
 	r.submissions = map[string]Submission{}
+	r.recordPromptLocked(telemetry.MetricSkipped, r.prompt)
 	prompt := r.drawPrompt()
 	r.prompt = &prompt
+	r.recordPromptLocked(telemetry.MetricPlayed, r.prompt)
 	r.setPhaseLocked(PhaseSubmitting, time.Duration(r.submitSecs)*time.Second)
 	r.scheduleComputerTurnsLocked()
 	r.touch()
@@ -648,6 +689,7 @@ func (r *Room) beginRoundLocked() {
 	r.submissions = map[string]Submission{}
 	prompt := r.drawPrompt()
 	r.prompt = &prompt
+	r.recordPromptLocked(telemetry.MetricPlayed, r.prompt)
 	r.judgeID = r.order[r.judgeIndex%len(r.order)]
 	for _, id := range r.order {
 		p := r.players[id]
@@ -675,6 +717,7 @@ func (r *Room) awardLocked(submissionID string) {
 	sub := r.submissions[submissionID]
 	sub.IsWinner = true
 	r.submissions[submissionID] = sub
+	r.recordAnswerLocked(telemetry.MetricWon, sub.Answer)
 	reachedLimit := false
 	if p := r.players[sub.PlayerID]; p != nil {
 		p.Score++
