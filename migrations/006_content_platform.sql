@@ -10,8 +10,11 @@ CREATE TABLE card_reports (
     answer_card_id UUID REFERENCES answer_cards(id) ON DELETE CASCADE,
     reason TEXT NOT NULL CHECK (reason IN ('offensive', 'broken', 'unfunny', 'duplicate', 'other')),
     detail TEXT NOT NULL DEFAULT '' CHECK (char_length(detail) <= 280),
-    -- Salted hash of the reporting client. Enough to stop one person filing the
-    -- same report repeatedly, without storing anything identifying.
+    -- Dedupe fingerprint: sha256 of the reporting client's address and the card
+    -- id. It stores no address in the clear and is never read back, but it is
+    -- not a secret-salted hash: someone with database access who already
+    -- suspects a specific address could confirm that it reported a specific
+    -- card. That is an acceptable trade for keeping reporting account-free.
     reporter_hash BYTEA NOT NULL CHECK (octet_length(reporter_hash) = 32),
     room_code TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

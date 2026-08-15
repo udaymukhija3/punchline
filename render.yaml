@@ -1,3 +1,8 @@
+# Single-instance demo path. This config has no DATABASE_URL, so the deploy runs
+# on the in-memory room registry and the seed deck: daily mode returns 503, the
+# admin desk 404s, and no card telemetry is collected. Add DATABASE_URL (plus
+# PUNCHLINE_ADMIN_TOKEN to open the desk) for the full platform, or use fly.toml,
+# which is the production-shaped target.
 services:
   - type: web
     name: punchline-demo

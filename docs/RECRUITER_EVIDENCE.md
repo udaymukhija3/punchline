@@ -15,8 +15,10 @@ meaningful health, readiness, smoke, and metrics gates.
   or one asynchronous prompt between game nights.
 - Core loops: the complete live judge/score loop and the durable daily
   submit/reveal/vote/result/streak loop.
-- Current status: playable live and daily modes with scoped guest identity, not
-  persistent accounts, live match history, moderation, or DB-backed deck loading.
+- Current status: playable live and daily modes with scoped guest identity, a
+  database-backed card platform with telemetry, player reporting, and a
+  token-gated moderation desk. Not persistent accounts, live match history, or
+  notifications.
 - Deployment intent: one Go container serving API, WebSockets, health/readiness,
   metrics, and the built React client. Fly.io is production-shaped; Render is a
   single-instance demo path.
@@ -43,10 +45,15 @@ WebSockets, while `scripts/smoke-daily.mjs` drives a durable group flow and
 cleans it up. Go/Postgres tests cover authorization, redaction, idempotency,
 concurrent workers, state recovery, lease transfer, and slow-socket bounds.
 
+| Database-backed content platform with player-sourced curation | A party game dies when its deck goes stale or ships a card that hurts someone. Content must be swappable without a redeploy, measurable in play, reportable by players, and moderatable by one operator. | `backend/internal/cards/store.go` loads approved cards from approved packs and revalidates playable minimums; `migrations/005_seed_official_pack.sql` is generated from `seed/cards.json` so the two cannot drift. `backend/internal/telemetry/cards.go` aggregates play/win/skip events and flushes batched updates, dropping rather than blocking when full. `backend/internal/daily/promote.go` harvests voted daily answers into deduped candidates. `backend/internal/content/service.go` dedupes reports per reporter, auto-retires at three, and promotes candidates into the community pack. `backend/internal/httpapi/admin.go` fails closed when `PUNCHLINE_ADMIN_TOKEN` is unset. | `TestPostgresDeckMatchesSeedDeckAndCarriesRowIDs` proves the database deck is interchangeable with the seed deck; `TestPostgresDeckRejectsOverRetiredContent` and `TestPostgresDeckIgnoresUnapprovedPacks` prove the loader fails loudly instead of dealing a broken hand. `TestPostgresReportsAutoRetireThenRestore` proves repeat reports from one client do not move the counter. `TestPostgresFinalizationHarvestsCandidates` proves the pipeline produces candidates and that deleting a group withdraws them. `scripts/smoke-content.mjs` covers the deployed API. | `PUNCHLINE_DECK_SOURCE` pins deck origin; `/metrics` exposes content actions, auto-retirements, and telemetry flushed/dropped/failed; `docs/CONTENT_PLATFORM.md` states the pipeline and its boundaries. | PROVEN | Add per-room pack selection when players ask to choose packs. |
+
 ## Scope boundaries
 
 Do not present this repo as shipping persistent accounts, live match history,
-durable live results, database-backed deck loading, moderation/reporting,
-notifications, payments, app-store clients, or zero-downtime recovery from
-every failure. The honest public-beta claim is playable live and daily modes
-with production-shaped deployment, ready once manual platform work is complete.
+durable live results, notifications, payments, app-store clients, or
+zero-downtime recovery from every failure. Do not claim AI content generation:
+new cards come from players through the daily candidate queue, by design. Do
+not claim user-level moderation or bans; with no accounts, moderation acts on
+content only. The honest public-beta claim is playable live and daily modes on
+a database-backed content platform with production-shaped deployment, ready
+once manual platform work is complete.

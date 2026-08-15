@@ -448,3 +448,48 @@ func TestDailyCORSAllowsBearerAuthorization(t *testing.T) {
 		t.Fatalf("Access-Control-Allow-Headers = %q", got)
 	}
 }
+
+func TestAdminRoutesAreInvisibleWithoutAToken(t *testing.T) {
+	t.Setenv("PUNCHLINE_ADMIN_TOKEN", "")
+	h := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck()))
+	srv := httptest.NewServer(h.Routes())
+	defer srv.Close()
+
+	for _, path := range []string{"/api/admin/overview", "/api/admin/reports", "/api/admin/candidates", "/api/admin/cards"} {
+		res, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		// 404, not 401: an unconfigured desk should not advertise that it exists.
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s without a token = %d, want 404", path, res.StatusCode)
+		}
+	}
+}
+
+func TestAdminAuthFailuresAreRateLimited(t *testing.T) {
+	t.Setenv("PUNCHLINE_ADMIN_TOKEN", "the-real-token")
+	t.Setenv("PUNCHLINE_ADMIN_AUTH_FAILURE_LIMIT_PER_MIN", "3")
+	h := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck()))
+	srv := httptest.NewServer(h.Routes())
+	defer srv.Close()
+
+	statuses := []int{}
+	for i := 0; i < 5; i++ {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/admin/overview", nil)
+		req.Header.Set("Authorization", "Bearer wrong-guess")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		statuses = append(statuses, res.StatusCode)
+	}
+	if statuses[0] != http.StatusUnauthorized || statuses[2] != http.StatusUnauthorized {
+		t.Fatalf("early guesses = %v, want 401s", statuses)
+	}
+	if statuses[3] != http.StatusTooManyRequests || statuses[4] != http.StatusTooManyRequests {
+		t.Fatalf("guesses past the limit = %v, want 429s", statuses)
+	}
+}

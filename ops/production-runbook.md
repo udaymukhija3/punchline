@@ -25,6 +25,11 @@ handoff for a new coding agent or fresh chat.
 - `PUNCHLINE_ALLOWED_ORIGINS`: comma-separated public origins.
 - `PUNCHLINE_REQUIRE_DATABASE=true`: fail release migrations if DB is missing.
 - `PUNCHLINE_METRICS_TOKEN`: optional bearer token protecting `/metrics`.
+- `PUNCHLINE_ADMIN_TOKEN`: optional bearer token enabling the `/admin` desk.
+  Leave it unset and every admin route returns 404, which is the correct state
+  for any deployment nobody moderates. Generate at least 32 random characters
+  (`openssl rand -base64 32`), rotate by replacing the secret and redeploying;
+  operators re-enter it in the desk, and no session survives rotation.
 - `PUNCHLINE_TRUST_PROXY_HEADERS` or `PUNCHLINE_TRUSTED_PROXY_CIDRS`: enable
   forwarded client IP headers only after the edge/load balancer is confirmed to
   overwrite or strip spoofed values.
@@ -45,7 +50,14 @@ handoff for a new coding agent or fresh chat.
 - `PUNCHLINE_DAILY_CREATE_LIMIT_PER_MIN`
 - `PUNCHLINE_DAILY_JOIN_LIMIT_PER_MIN`
 - `PUNCHLINE_DAILY_ACTION_LIMIT_PER_MIN`
-- `DAILY_WORKER_INTERVAL`
+- `DAILY_WORKER_INTERVAL`. Only one instance ticks at a time; the rest yield on
+  a Postgres advisory lock, so raising machine count does not multiply the scan.
+- `PUNCHLINE_DECK_SOURCE`: `auto` (default) prefers the database deck and falls
+  back to `seed/cards.json`; `database` refuses to boot without a usable
+  database deck; `seed` ignores the database. Use `database` if you would
+  rather a bad content state fail the deploy than silently serve the seed deck.
+- `PUNCHLINE_REPORT_LIMIT_PER_MIN`, `CARD_TELEMETRY_FLUSH_INTERVAL`,
+  `CARD_TELEMETRY_BUFFER`
 - `PUNCHLINE_TRUSTED_PROXY_CIDRS` accepts comma-separated CIDRs plus `loopback`
   and `private` shortcuts. Prefer CIDRs over trusting every peer.
 
@@ -53,7 +65,7 @@ handoff for a new coding agent or fresh chat.
 
 1. Confirm CI is green, including the Postgres-backed smoke job.
 2. Provision/update `DATABASE_URL`, `PUNCHLINE_ALLOWED_ORIGINS`, and, if used,
-   `PUNCHLINE_METRICS_TOKEN` as platform secrets.
+   `PUNCHLINE_METRICS_TOKEN` and `PUNCHLINE_ADMIN_TOKEN` as platform secrets.
 3. Confirm the database provider has automated backups enabled before deploy.
 4. Deploy the Docker image. Fly runs `/app/migrate` through `release_command`;
    migration execution is serialized and checksums prevent edited history.
@@ -94,6 +106,19 @@ handoff for a new coding agent or fresh chat.
 - `punchline_database_connections_in_use` near
   `punchline_database_max_open_connections`, or a rising wait counter: raise
   the app pool only after checking the database connection budget.
+- `punchline_cards_auto_retired_total` rising: cards are being pulled from
+  rotation by player reports. Either a bad batch of content shipped or someone
+  is abusing the report endpoint. Check the `/admin` report queue before
+  restoring anything, and compare against `punchline_content_actions_total`.
+- `punchline_card_telemetry_events_total{outcome="dropped"}` rising: the
+  telemetry buffer is saturating. Gameplay is unaffected by design, but the
+  counts are undercounting; raise `CARD_TELEMETRY_BUFFER` or shorten
+  `CARD_TELEMETRY_FLUSH_INTERVAL`.
+- `punchline_card_telemetry_events_total{outcome="failed"}` rising: flushes are
+  erroring against Postgres. Check pool saturation first.
+- Deck source is logged once at startup (`deck source=...`). If it reads
+  `seed` on a deployment with a database, the database deck failed validation —
+  check that migration 005 applied and that too many cards are not retired.
 - Recovery after an ungraceful owner loss can take up to `ROOM_LEASE_TTL`.
   Graceful deploys drain sockets, release room leases, and allow immediate
   recovery on another machine.

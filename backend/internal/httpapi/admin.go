@@ -26,6 +26,13 @@ func (h *Handler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	}
 	presented := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !constantTimeEqual(presented, "Bearer "+h.adminToken) {
+		// Rate limit wrong guesses. The comparison is already constant time, so
+		// this is about making an online brute force impractical rather than
+		// about leaking timing. Only failures count against the limit, so a
+		// working desk is never throttled.
+		if !h.allowRequest(w, r, "admin_auth_failure", h.adminAuthFailureLimitPerMin) {
+			return false
+		}
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "admin authorization required")
 		return false

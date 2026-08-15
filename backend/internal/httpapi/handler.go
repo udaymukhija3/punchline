@@ -24,23 +24,24 @@ import (
 const maxJoinBody = 4 << 10
 
 type Handler struct {
-	manager                *realtime.RoomManager
-	daily                  *daily.Service
-	content                *content.Service
-	adminToken             string
-	reportLimitPerMin      int
-	allowedOrigins         map[string]bool
-	metrics                *metrics
-	metricsToken           string
-	limiter                *rateLimiter
-	proxyHeaders           proxyHeaderConfig
-	roomCreateLimitPerMin  int
-	roomJoinLimitPerMin    int
-	wsConnectLimitPerMin   int
-	wsMessageLimitPerMin   int
-	dailyCreateLimitPerMin int
-	dailyJoinLimitPerMin   int
-	dailyActionLimitPerMin int
+	manager                     *realtime.RoomManager
+	daily                       *daily.Service
+	content                     *content.Service
+	adminToken                  string
+	reportLimitPerMin           int
+	adminAuthFailureLimitPerMin int
+	allowedOrigins              map[string]bool
+	metrics                     *metrics
+	metricsToken                string
+	limiter                     *rateLimiter
+	proxyHeaders                proxyHeaderConfig
+	roomCreateLimitPerMin       int
+	roomJoinLimitPerMin         int
+	wsConnectLimitPerMin        int
+	wsMessageLimitPerMin        int
+	dailyCreateLimitPerMin      int
+	dailyJoinLimitPerMin        int
+	dailyActionLimitPerMin      int
 }
 
 var errUnknownMessage = errors.New("unknown websocket message type")
@@ -51,23 +52,24 @@ func NewHandler(manager *realtime.RoomManager, dailyServices ...*daily.Service) 
 		dailyService = dailyServices[0]
 	}
 	return &Handler{
-		manager:                manager,
-		daily:                  dailyService,
-		content:                content.NewService(nil),
-		adminToken:             strings.TrimSpace(os.Getenv("PUNCHLINE_ADMIN_TOKEN")),
-		reportLimitPerMin:      getenvLimit("PUNCHLINE_REPORT_LIMIT_PER_MIN", 20),
-		allowedOrigins:         parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
-		metrics:                newMetrics(),
-		metricsToken:           strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
-		limiter:                newRateLimiter(),
-		proxyHeaders:           newProxyHeaderConfig(),
-		roomCreateLimitPerMin:  getenvLimit("PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN", defaultRoomCreateLimitPerMin),
-		roomJoinLimitPerMin:    getenvLimit("PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN", defaultRoomJoinLimitPerMin),
-		wsConnectLimitPerMin:   getenvLimit("PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN", defaultWSConnectLimitPerMin),
-		wsMessageLimitPerMin:   getenvLimit("PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN", defaultWSMessageLimitPerMin),
-		dailyCreateLimitPerMin: getenvLimit("PUNCHLINE_DAILY_CREATE_LIMIT_PER_MIN", 10),
-		dailyJoinLimitPerMin:   getenvLimit("PUNCHLINE_DAILY_JOIN_LIMIT_PER_MIN", 40),
-		dailyActionLimitPerMin: getenvLimit("PUNCHLINE_DAILY_ACTION_LIMIT_PER_MIN", 120),
+		manager:                     manager,
+		daily:                       dailyService,
+		content:                     content.NewService(nil),
+		adminToken:                  strings.TrimSpace(os.Getenv("PUNCHLINE_ADMIN_TOKEN")),
+		reportLimitPerMin:           getenvLimit("PUNCHLINE_REPORT_LIMIT_PER_MIN", 20),
+		adminAuthFailureLimitPerMin: getenvLimit("PUNCHLINE_ADMIN_AUTH_FAILURE_LIMIT_PER_MIN", 10),
+		allowedOrigins:              parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
+		metrics:                     newMetrics(),
+		metricsToken:                strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
+		limiter:                     newRateLimiter(),
+		proxyHeaders:                newProxyHeaderConfig(),
+		roomCreateLimitPerMin:       getenvLimit("PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN", defaultRoomCreateLimitPerMin),
+		roomJoinLimitPerMin:         getenvLimit("PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN", defaultRoomJoinLimitPerMin),
+		wsConnectLimitPerMin:        getenvLimit("PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN", defaultWSConnectLimitPerMin),
+		wsMessageLimitPerMin:        getenvLimit("PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN", defaultWSMessageLimitPerMin),
+		dailyCreateLimitPerMin:      getenvLimit("PUNCHLINE_DAILY_CREATE_LIMIT_PER_MIN", 10),
+		dailyJoinLimitPerMin:        getenvLimit("PUNCHLINE_DAILY_JOIN_LIMIT_PER_MIN", 40),
+		dailyActionLimitPerMin:      getenvLimit("PUNCHLINE_DAILY_ACTION_LIMIT_PER_MIN", 120),
 	}
 }
 
@@ -114,13 +116,15 @@ func (h *Handler) Routes() http.Handler {
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	stats := h.manager.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":               true,
-		"instance_id":      stats.InstanceID,
-		"room_registry":    stats.RoomRegistry,
-		"room_state_store": stats.RoomStateStore,
-		"local_room_count": stats.LocalRoomCount,
-		"draining":         stats.Draining,
-		"daily_available":  h.daily.Available(),
+		"ok":                true,
+		"instance_id":       stats.InstanceID,
+		"room_registry":     stats.RoomRegistry,
+		"room_state_store":  stats.RoomStateStore,
+		"local_room_count":  stats.LocalRoomCount,
+		"draining":          stats.Draining,
+		"daily_available":   h.daily.Available(),
+		"content_available": h.content.Available(),
+		"admin_enabled":     h.adminToken != "",
 	})
 }
 
