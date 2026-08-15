@@ -80,6 +80,7 @@ jobs:
           export PUNCHLINE_REQUIRE_DATABASE=true
           /tmp/punchline-migrate
           (cd backend && go test ./internal/roomstore -run TestPostgresReleaseRetainsRoomState -count=1)
+          (cd backend && go test ./internal/daily -run TestPostgresDailyLifecyclePrivacyIdempotencyAndConcurrentWorker -count=1)
           PORT=18080 /tmp/punchline-api &
           api_pid=$!
           trap 'kill "$api_pid" 2>/dev/null || true' EXIT
@@ -91,3 +92,4 @@ jobs:
           done
           curl -fsS http://127.0.0.1:18080/readyz >/dev/null
           node scripts/smoke-realtime.mjs http://127.0.0.1:18080
+          node scripts/smoke-daily.mjs http://127.0.0.1:18080

@@ -16,12 +16,16 @@ import (
 type metrics struct {
 	mu sync.Mutex
 
-	httpRequests map[httpMetricKey]uint64
-	httpDuration map[httpMetricKey]durationMetric
-	roomsCreated map[string]uint64
-	wsMessages   map[wsMessageKey]uint64
-	actionErrors map[string]uint64
-	rateLimited  map[string]uint64
+	httpRequests           map[httpMetricKey]uint64
+	httpDuration           map[httpMetricKey]durationMetric
+	roomsCreated           map[string]uint64
+	wsMessages             map[wsMessageKey]uint64
+	actionErrors           map[string]uint64
+	rateLimited            map[string]uint64
+	dailyActions           map[wsMessageKey]uint64
+	dailyTransitions       map[string]uint64
+	dailyWorkerErrors      uint64
+	dailyWorkerLastSuccess float64
 
 	wsConnectionsTotal uint64
 	wsActive           int64
@@ -45,13 +49,40 @@ type durationMetric struct {
 
 func newMetrics() *metrics {
 	return &metrics{
-		httpRequests: map[httpMetricKey]uint64{},
-		httpDuration: map[httpMetricKey]durationMetric{},
-		roomsCreated: map[string]uint64{},
-		wsMessages:   map[wsMessageKey]uint64{},
-		actionErrors: map[string]uint64{},
-		rateLimited:  map[string]uint64{},
+		httpRequests:     map[httpMetricKey]uint64{},
+		httpDuration:     map[httpMetricKey]durationMetric{},
+		roomsCreated:     map[string]uint64{},
+		wsMessages:       map[wsMessageKey]uint64{},
+		actionErrors:     map[string]uint64{},
+		rateLimited:      map[string]uint64{},
+		dailyActions:     map[wsMessageKey]uint64{},
+		dailyTransitions: map[string]uint64{},
 	}
+}
+
+func (m *metrics) recordDailyAction(action, result string) {
+	if action == "" {
+		action = "unknown"
+	}
+	if result == "" {
+		result = "ok"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dailyActions[wsMessageKey{Type: action, Result: result}]++
+}
+
+func (m *metrics) recordDailyWorker(created, revealed, finalized int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err != nil {
+		m.dailyWorkerErrors++
+		return
+	}
+	m.dailyWorkerLastSuccess = float64(time.Now().Unix())
+	m.dailyTransitions["created"] += uint64(created)
+	m.dailyTransitions["revealed"] += uint64(revealed)
+	m.dailyTransitions["finalized"] += uint64(finalized)
 }
 
 func (m *metrics) recordHTTPRequest(method, route string, status int, elapsed time.Duration) {
@@ -173,6 +204,23 @@ func (m *metrics) writePrometheus(w http.ResponseWriter, stats realtime.RoomMana
 		fmt.Fprintf(w, "punchline_rate_limited_total{scope=%q} %d\n", scope, m.rateLimited[scope])
 	}
 
+	fmt.Fprintln(w, "# HELP punchline_daily_actions_total Daily-mode API actions by action and result.")
+	fmt.Fprintln(w, "# TYPE punchline_daily_actions_total counter")
+	for _, key := range sortedWSKeys(m.dailyActions) {
+		fmt.Fprintf(w, "punchline_daily_actions_total{action=%q,result=%q} %d\n", key.Type, key.Result, m.dailyActions[key])
+	}
+	fmt.Fprintln(w, "# HELP punchline_daily_round_transitions_total Daily rounds created or transitioned by the worker.")
+	fmt.Fprintln(w, "# TYPE punchline_daily_round_transitions_total counter")
+	for _, transition := range sortedStringKeys(m.dailyTransitions) {
+		fmt.Fprintf(w, "punchline_daily_round_transitions_total{transition=%q} %d\n", transition, m.dailyTransitions[transition])
+	}
+	fmt.Fprintln(w, "# HELP punchline_daily_worker_errors_total Daily worker executions that failed.")
+	fmt.Fprintln(w, "# TYPE punchline_daily_worker_errors_total counter")
+	fmt.Fprintf(w, "punchline_daily_worker_errors_total %d\n", m.dailyWorkerErrors)
+	fmt.Fprintln(w, "# HELP punchline_daily_worker_last_success_unixtime Last successful daily worker execution.")
+	fmt.Fprintln(w, "# TYPE punchline_daily_worker_last_success_unixtime gauge")
+	fmt.Fprintf(w, "punchline_daily_worker_last_success_unixtime %.0f\n", m.dailyWorkerLastSuccess)
+
 	fmt.Fprintln(w, "# HELP punchline_rooms_local Rooms currently hosted by this instance.")
 	fmt.Fprintln(w, "# TYPE punchline_rooms_local gauge")
 	fmt.Fprintf(w, "punchline_rooms_local{instance=%q,registry=%q} %d\n", stats.InstanceID, stats.RoomRegistry, stats.LocalRoomCount)
@@ -253,6 +301,18 @@ func routeLabel(r *http.Request) string {
 		return "/api/rooms/{code}/join"
 	case strings.HasPrefix(path, "/api/rooms/"):
 		return "/api/rooms/{code}"
+	case path == "/api/daily/groups":
+		return "/api/daily/groups"
+	case strings.HasPrefix(path, "/api/daily/groups/") && r.Method == http.MethodDelete:
+		return "/api/daily/groups/{code}"
+	case strings.HasPrefix(path, "/api/daily/groups/") && strings.HasSuffix(strings.TrimRight(path, "/"), "/join"):
+		return "/api/daily/groups/{code}/join"
+	case strings.HasPrefix(path, "/api/daily/groups/") && strings.HasSuffix(strings.TrimRight(path, "/"), "/today"):
+		return "/api/daily/groups/{code}/today"
+	case strings.HasPrefix(path, "/api/daily/rounds/") && strings.HasSuffix(strings.TrimRight(path, "/"), "/submit"):
+		return "/api/daily/rounds/{id}/submit"
+	case strings.HasPrefix(path, "/api/daily/rounds/") && strings.HasSuffix(strings.TrimRight(path, "/"), "/vote"):
+		return "/api/daily/rounds/{id}/vote"
 	case strings.HasPrefix(path, "/ws/rooms/"):
 		return "/ws/rooms/{code}"
 	case strings.HasPrefix(path, "/assets/"):

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"punchline/backend/internal/daily"
 	"punchline/backend/internal/realtime"
 	"punchline/backend/internal/ws"
 )
@@ -21,32 +22,44 @@ import (
 const maxJoinBody = 4 << 10
 
 type Handler struct {
-	manager               *realtime.RoomManager
-	allowedOrigins        map[string]bool
-	metrics               *metrics
-	metricsToken          string
-	limiter               *rateLimiter
-	proxyHeaders          proxyHeaderConfig
-	roomCreateLimitPerMin int
-	roomJoinLimitPerMin   int
-	wsConnectLimitPerMin  int
-	wsMessageLimitPerMin  int
+	manager                *realtime.RoomManager
+	daily                  *daily.Service
+	allowedOrigins         map[string]bool
+	metrics                *metrics
+	metricsToken           string
+	limiter                *rateLimiter
+	proxyHeaders           proxyHeaderConfig
+	roomCreateLimitPerMin  int
+	roomJoinLimitPerMin    int
+	wsConnectLimitPerMin   int
+	wsMessageLimitPerMin   int
+	dailyCreateLimitPerMin int
+	dailyJoinLimitPerMin   int
+	dailyActionLimitPerMin int
 }
 
 var errUnknownMessage = errors.New("unknown websocket message type")
 
-func NewHandler(manager *realtime.RoomManager) *Handler {
+func NewHandler(manager *realtime.RoomManager, dailyServices ...*daily.Service) *Handler {
+	dailyService := daily.UnavailableService()
+	if len(dailyServices) > 0 && dailyServices[0] != nil {
+		dailyService = dailyServices[0]
+	}
 	return &Handler{
-		manager:               manager,
-		allowedOrigins:        parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
-		metrics:               newMetrics(),
-		metricsToken:          strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
-		limiter:               newRateLimiter(),
-		proxyHeaders:          newProxyHeaderConfig(),
-		roomCreateLimitPerMin: getenvLimit("PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN", defaultRoomCreateLimitPerMin),
-		roomJoinLimitPerMin:   getenvLimit("PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN", defaultRoomJoinLimitPerMin),
-		wsConnectLimitPerMin:  getenvLimit("PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN", defaultWSConnectLimitPerMin),
-		wsMessageLimitPerMin:  getenvLimit("PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN", defaultWSMessageLimitPerMin),
+		manager:                manager,
+		daily:                  dailyService,
+		allowedOrigins:         parseAllowedOrigins(os.Getenv("PUNCHLINE_ALLOWED_ORIGINS")),
+		metrics:                newMetrics(),
+		metricsToken:           strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")),
+		limiter:                newRateLimiter(),
+		proxyHeaders:           newProxyHeaderConfig(),
+		roomCreateLimitPerMin:  getenvLimit("PUNCHLINE_ROOM_CREATE_LIMIT_PER_MIN", defaultRoomCreateLimitPerMin),
+		roomJoinLimitPerMin:    getenvLimit("PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN", defaultRoomJoinLimitPerMin),
+		wsConnectLimitPerMin:   getenvLimit("PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN", defaultWSConnectLimitPerMin),
+		wsMessageLimitPerMin:   getenvLimit("PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN", defaultWSMessageLimitPerMin),
+		dailyCreateLimitPerMin: getenvLimit("PUNCHLINE_DAILY_CREATE_LIMIT_PER_MIN", 10),
+		dailyJoinLimitPerMin:   getenvLimit("PUNCHLINE_DAILY_JOIN_LIMIT_PER_MIN", 40),
+		dailyActionLimitPerMin: getenvLimit("PUNCHLINE_DAILY_ACTION_LIMIT_PER_MIN", 120),
 	}
 }
 
@@ -58,6 +71,9 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/api/computer-room", h.computerRoom)
 	mux.HandleFunc("/api/rooms", h.rooms)
 	mux.HandleFunc("/api/rooms/", h.roomByCode)
+	mux.HandleFunc("/api/daily/groups", h.dailyGroups)
+	mux.HandleFunc("/api/daily/groups/", h.dailyGroupByCode)
+	mux.HandleFunc("/api/daily/rounds/", h.dailyRoundAction)
 	mux.HandleFunc("/ws/rooms/", h.wsRoom)
 	if dir := staticDir(); dir != "" {
 		mux.Handle("/", spaHandler(dir))
@@ -74,6 +90,7 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		"room_state_store": stats.RoomStateStore,
 		"local_room_count": stats.LocalRoomCount,
 		"draining":         stats.Draining,
+		"daily_available":  h.daily.Available(),
 	})
 }
 
@@ -82,6 +99,10 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 // away from this instance without killing it.
 func (h *Handler) ready(w http.ResponseWriter, r *http.Request) {
 	if err := h.manager.Ready(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "error": err.Error()})
+		return
+	}
+	if err := h.daily.Ready(r.Context()); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "error": err.Error()})
 		return
 	}
@@ -374,8 +395,8 @@ func (h *Handler) cors(next http.Handler) http.Handler {
 				return
 			} else {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-				w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
 			}
 		}
 		if r.Method == http.MethodOptions {

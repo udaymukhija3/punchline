@@ -14,8 +14,8 @@ handoff for a new coding agent or fresh chat.
 - Prefer Fly.io for production because `fly.toml` is wired for `/readyz`,
   release migrations, HTTPS, and room-owner replay.
 - Keep managed Postgres in the same primary region as the app. Postgres holds
-  room ownership leases and durable active-room snapshots; it is required for
-  the production Fly configuration.
+  room ownership leases, durable active-room snapshots, and all daily-mode
+  state; it is required for the production Fly configuration.
 - Treat Render free as demo-only unless it is upgraded and given equivalent
   database, migration, and rollback controls.
 
@@ -42,6 +42,10 @@ handoff for a new coding agent or fresh chat.
 - `PUNCHLINE_ROOM_JOIN_LIMIT_PER_MIN`
 - `PUNCHLINE_WS_CONNECT_LIMIT_PER_MIN`
 - `PUNCHLINE_WS_MESSAGE_LIMIT_PER_MIN`
+- `PUNCHLINE_DAILY_CREATE_LIMIT_PER_MIN`
+- `PUNCHLINE_DAILY_JOIN_LIMIT_PER_MIN`
+- `PUNCHLINE_DAILY_ACTION_LIMIT_PER_MIN`
+- `DAILY_WORKER_INTERVAL`
 - `PUNCHLINE_TRUSTED_PROXY_CIDRS` accepts comma-separated CIDRs plus `loopback`
   and `private` shortcuts. Prefer CIDRs over trusting every peer.
 
@@ -56,8 +60,9 @@ handoff for a new coding agent or fresh chat.
 5. Run `PUNCHLINE_METRICS_TOKEN=... node scripts/deploy-check.mjs "$PUNCHLINE_BASE_URL"`
    when metrics are protected; omit the variable otherwise. The full deploy
    check expects the same container to serve the React app shell, built assets,
-   `/readyz`, `/metrics`, and the realtime WebSocket flow. Use `--api-only`
-   only for backend-only local development servers.
+   `/readyz`, `/metrics`, the realtime WebSocket flow, and the daily REST flow.
+   Use `--api-only` only for backend-only local development servers; set
+   `PUNCHLINE_CHECK_DAILY=true` to include daily mode in an API-only check.
 6. Confirm `/metrics` shows healthy state/registry saves and loads, low DB pool
    wait time, expected traffic, and no rising error/rate-limit counters.
 
@@ -92,6 +97,14 @@ handoff for a new coding agent or fresh chat.
 - Recovery after an ungraceful owner loss can take up to `ROOM_LEASE_TTL`.
   Graceful deploys drain sockets, release room leases, and allow immediate
   recovery on another machine.
+- `punchline_daily_worker_errors_total` rising: inspect Postgres connectivity,
+  migration status, and invalid group timezone data. The worker retries on its
+  next bounded interval.
+- `punchline_daily_worker_last_success_unixtime` older than two configured
+  intervals: treat daily deadlines as impaired even if normal HTTP is healthy.
+- A submission rejected at the deadline is expected. Mutation handlers compare
+  the absolute timestamp while locking the round, so worker lag does not extend
+  the submission or voting window.
 
 ## Manual Platform Checklist
 
@@ -118,3 +131,5 @@ handoff for a new coding agent or fresh chat.
 7. Perform one restore drill before calling the service production-ready: restore
    a recent backup to an isolated database, run `/app/migrate`, start a
    temporary app with that database, and complete `scripts/deploy-check.mjs`.
+
+The complete operator sequence is in `docs/DEPLOYMENT.md`.

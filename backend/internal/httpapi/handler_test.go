@@ -414,3 +414,37 @@ func TestMetricsTokenProtectsEndpointWhenConfigured(t *testing.T) {
 		t.Fatalf("authorized status = %d, want %d", authorized.Code, http.StatusOK)
 	}
 }
+
+func TestDailyModeFailsClosedWithoutPostgres(t *testing.T) {
+	handler := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck()))
+	body := bytes.NewBufferString(`{"name":"Daily friends","player_name":"Sam","timezone":"UTC"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/daily/groups", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "requires PostgreSQL") {
+		t.Fatalf("unexpected response: %s", rec.Body.String())
+	}
+}
+
+func TestDailyCORSAllowsBearerAuthorization(t *testing.T) {
+	handler := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck()))
+	req := httptest.NewRequest(http.MethodOptions, "/api/daily/groups/ABC234/today", nil)
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:5173")
+	rec := httptest.NewRecorder()
+
+	handler.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
+		t.Fatalf("Access-Control-Allow-Headers = %q", got)
+	}
+}

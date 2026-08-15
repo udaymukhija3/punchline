@@ -55,6 +55,10 @@ function plural(n, word) {
 }
 
 function App() {
+  return location.pathname.startsWith('/daily') ? <DailyApp /> : <LiveApp />;
+}
+
+function LiveApp() {
   const [session, setSession] = useState(loadSession);
   const [room, setRoom] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | connecting | connected | closed
@@ -249,6 +253,7 @@ function Landing({ onCreate, onJoin, onComputer, error, reconnecting, busyAction
               {busyAction === 'join' ? 'Joining...' : 'Join'}
             </button>
           </div>
+          <a className="btn ghost block daily-link" href="/daily">Play the daily async mode</a>
           {error && <p className="err" role="alert">{error}</p>}
         </div>
       </section>
@@ -643,6 +648,381 @@ function Finished({ room, isHost, send }) {
 
 function phaseLabel(phase) {
   return { lobby: 'Lobby', submitting: 'Answering', judging: 'Judging', scoring: 'Reveal', finished: 'Game over' }[phase] || phase;
+}
+
+const DAILY_SESSIONS_KEY = 'punchline.daily.sessions';
+const DAILY_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const loadDailySessions = () => {
+  try {
+    const value = JSON.parse(localStorage.getItem(DAILY_SESSIONS_KEY) || '[]');
+    return Array.isArray(value) ? value.filter((item) => item?.code && item?.token) : [];
+  } catch { return []; }
+};
+const saveDailySessions = (sessions) => localStorage.setItem(DAILY_SESSIONS_KEY, JSON.stringify(sessions));
+const normalizeDailyCode = (value) => [...String(value || '').toUpperCase()]
+  .filter((character) => DAILY_ALPHABET.includes(character)).slice(0, 6).join('');
+
+function rememberDailySession(session, sessions) {
+  const normalized = {
+    code: normalizeDailyCode(session.group.code),
+    token: session.token,
+    groupName: session.group.name,
+    playerName: session.membership.display_name,
+  };
+  const next = [normalized, ...sessions.filter((item) => item.code !== normalized.code)].slice(0, 20);
+  saveDailySessions(next);
+  return { normalized, next };
+}
+
+async function dailyRequest(path, { method = 'GET', token, body } = {}) {
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${API}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await readPayload(res);
+  if (!res.ok) throw new Error(data.error || 'The daily request failed.');
+  return data;
+}
+
+function DailyApp() {
+  const joinCode = normalizeDailyCode(new URLSearchParams(location.search).get('join') || '');
+  const initialSessions = loadDailySessions();
+  const initialActive = joinCode ? initialSessions.find((item) => item.code === joinCode) : initialSessions[0];
+  const [sessions, setSessions] = useState(initialSessions);
+  const [active, setActive] = useState(initialActive || null);
+  const [view, setView] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+
+  const loadToday = useCallback(async (session = active, quiet = false) => {
+    if (!session) return;
+    if (!quiet) setBusy('load');
+    try {
+      const data = await dailyRequest(`/api/daily/groups/${session.code}/today`, { token: session.token });
+      setView(data);
+      setError('');
+    } catch (err) {
+      setError(errorMessage(err, 'Could not load the daily round.'));
+    } finally {
+      if (!quiet) setBusy('');
+    }
+  }, [active]);
+
+  useEffect(() => {
+    if (active) loadToday(active);
+  }, [active, loadToday]);
+
+  useEffect(() => {
+    if (!active) return undefined;
+    const id = setInterval(() => loadToday(active, true), 60000);
+    return () => clearInterval(id);
+  }, [active, loadToday]);
+
+  function activateSession(sessionResponse) {
+    const remembered = rememberDailySession(sessionResponse, sessions);
+    setSessions(remembered.next);
+    setActive(remembered.normalized);
+    setView(null);
+  }
+
+  async function createGroup(input) {
+    setBusy('create'); setError('');
+    try {
+      const data = await dailyRequest('/api/daily/groups', { method: 'POST', body: input });
+      activateSession(data);
+      history.replaceState(null, '', '/daily');
+    } catch (err) { setError(errorMessage(err, 'Could not create the group.')); }
+    finally { setBusy(''); }
+  }
+
+  async function joinGroup(code, playerName) {
+    setBusy('join'); setError('');
+    try {
+      const normalized = normalizeDailyCode(code);
+      const data = await dailyRequest(`/api/daily/groups/${normalized}/join`, {
+        method: 'POST', body: { player_name: playerName },
+      });
+      activateSession(data);
+      history.replaceState(null, '', '/daily');
+    } catch (err) { setError(errorMessage(err, 'Could not join the group.')); }
+    finally { setBusy(''); }
+  }
+
+  function switchGroup(session) {
+    setView(null); setError(''); setActive(session);
+    history.replaceState(null, '', '/daily');
+  }
+
+  if (!active || (joinCode && active.code !== joinCode)) {
+    return <DailyLanding sessions={sessions} joinCode={joinCode} busy={busy} error={error}
+      onCreate={createGroup} onJoin={joinGroup} onOpen={switchGroup} />;
+  }
+  return <DailyDashboard session={active} sessions={sessions} view={view} busy={busy} error={error}
+    onRefresh={() => loadToday(active)} onSwitch={() => { setActive(null); setView(null); }} />;
+}
+
+function DailyLanding({ sessions, joinCode, busy, error, onCreate, onJoin, onOpen }) {
+  const [playerName, setPlayerName] = useState(localStorage.getItem('punchline.name') || '');
+  const [groupName, setGroupName] = useState('');
+  const [code, setCode] = useState(joinCode);
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const rememberName = (value) => { setPlayerName(value); localStorage.setItem('punchline.name', value); };
+  const cleanPlayer = playerName.trim();
+
+  return (
+    <main className="shell daily-shell">
+      <header className="daily-topbar">
+        <a className="logo daily-logo" href="/">Punchline</a>
+        <a className="btn ghost small" href="/">Live game</a>
+      </header>
+      <section className="daily-hero">
+        <div>
+          <span className="eyebrow">One prompt. All day.</span>
+          <h1>Keep the group chat funny between game nights.</h1>
+          <p>Submit before the reveal, vote blind, then see who won. Your timezone is used so the daily deadline makes sense.</p>
+        </div>
+        <div className="panel daily-start-panel" aria-busy={!!busy}>
+          <label htmlFor="daily-player">Your name</label>
+          <input id="daily-player" className="field" maxLength={20} value={playerName} autoComplete="nickname"
+            onChange={(event) => rememberName(event.target.value)} placeholder="e.g. Sam" />
+          {joinCode ? <>
+            <div className="daily-invite-code">Invited to <b>{joinCode}</b></div>
+            <button className="btn primary block" disabled={!cleanPlayer || !!busy} onClick={() => onJoin(joinCode, cleanPlayer)}>
+              {busy === 'join' ? 'Joining…' : 'Join daily group'}
+            </button>
+          </> : <>
+            <label htmlFor="daily-group">New group name</label>
+            <input id="daily-group" className="field" maxLength={40} value={groupName}
+              onChange={(event) => setGroupName(event.target.value)} placeholder="Friday people" />
+            <button className="btn primary block" disabled={!cleanPlayer || groupName.trim().length < 2 || !!busy}
+              onClick={() => onCreate({ name: groupName.trim(), player_name: cleanPlayer, timezone })}>
+              {busy === 'create' ? 'Creating…' : 'Create daily group'}
+            </button>
+            <div className="divider"><span>or join with a code</span></div>
+            <div className="join-box daily-join-box">
+              <input className="field code-input" aria-label="Daily group code" maxLength={6} value={code}
+                onChange={(event) => setCode(normalizeDailyCode(event.target.value))} placeholder="6-letter code" />
+              <button className="btn" disabled={!cleanPlayer || code.length !== 6 || !!busy} onClick={() => onJoin(code, cleanPlayer)}>
+                {busy === 'join' ? 'Joining…' : 'Join'}
+              </button>
+            </div>
+          </>}
+          {error && <p className="err" role="alert">{error}</p>}
+        </div>
+      </section>
+      {sessions.length > 0 && !joinCode && <section className="saved-groups" aria-label="Your saved daily groups">
+        <h2>Your groups</h2>
+        <div className="saved-group-grid">
+          {sessions.map((session) => <button className="saved-group" key={session.code} onClick={() => onOpen(session)}>
+            <b>{session.groupName}</b><span>{session.code} · as {session.playerName}</span>
+          </button>)}
+        </div>
+      </section>}
+    </main>
+  );
+}
+
+function DailyDashboard({ session, sessions, view, busy, error, onRefresh, onSwitch }) {
+  const inviteURL = `${location.origin}/daily?join=${session.code}`;
+  const [notice, setNotice] = useState('');
+
+  async function shareInvite() {
+    const text = `Join ${view?.group?.name || session.groupName} on Punchline Daily.`;
+    try {
+      if (navigator.share) await navigator.share({ title: 'Punchline Daily', text, url: inviteURL });
+      else { await navigator.clipboard.writeText(inviteURL); setNotice('Invite link copied.'); }
+    } catch (err) {
+      if (err?.name !== 'AbortError') setNotice(`Copy this invite: ${inviteURL}`);
+    }
+  }
+
+  async function deleteGroup() {
+    if (!confirm(`Delete ${view.group.name} and every daily round? This cannot be undone.`)) return;
+    try {
+      await dailyRequest(`/api/daily/groups/${session.code}`, { method: 'DELETE', token: session.token });
+      const next = sessions.filter((item) => item.code !== session.code);
+      saveDailySessions(next);
+      location.href = '/daily';
+    } catch (err) {
+      setNotice(errorMessage(err, 'Could not delete the group.'));
+    }
+  }
+
+  return (
+    <main className="shell daily-shell">
+      <header className="daily-topbar">
+        <a className="logo daily-logo" href="/">Punchline</a>
+        <div className="daily-nav-actions">
+          <button className="btn small" onClick={shareInvite}>Invite</button>
+          <button className="btn ghost small" onClick={onSwitch}>{sessions.length > 1 ? 'Switch group' : 'Groups'}</button>
+        </div>
+      </header>
+      {error && <p className="err banner" role="alert">{error} <button className="inline-button" onClick={onRefresh}>Try again</button></p>}
+      {notice && <p className="share-notice" aria-live="polite">{notice}</p>}
+      {!view ? <section className="daily-loading"><div className="logo daily-logo">Punchline</div><p>{busy ? 'Loading today’s prompt…' : 'Getting the round ready…'}</p></section>
+        : <><DailyRoundView view={view} session={session} onChanged={onRefresh} setNotice={setNotice} />
+          {view.membership.role === 'owner' && <div className="daily-danger"><button className="inline-button" onClick={deleteGroup}>Delete this daily group</button></div>}</>}
+    </main>
+  );
+}
+
+function DailyRoundView({ view, session, onChanged, setNotice }) {
+  const round = view.today;
+  const previous = view.previous;
+  const deadline = round.state === 'OPEN_FOR_SUBMISSIONS' ? round.reveal_at : round.voting_closes_at;
+  const [answer, setAnswer] = useState(round.my_submission?.answer_text || '');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => setAnswer(round.my_submission?.answer_text || ''), [round.id, round.my_submission?.answer_text]);
+
+  async function submit() {
+    setBusy('submit'); setError('');
+    try {
+      await dailyRequest(`/api/daily/rounds/${round.id}/submit`, {
+        method: 'POST', token: session.token, body: { answer_text: answer.trim() },
+      });
+      setNotice(round.my_submission ? 'Your answer was updated.' : 'Your answer is locked in.');
+      await onChanged();
+    } catch (err) { setError(errorMessage(err, 'Could not save your answer.')); }
+    finally { setBusy(''); }
+  }
+
+  async function vote(submissionID) {
+    setBusy(`vote:${submissionID}`); setError('');
+    try {
+      await dailyRequest(`/api/daily/rounds/${round.id}/vote`, {
+        method: 'POST', token: session.token, body: { submission_id: submissionID },
+      });
+      setNotice(round.my_vote_submission_id ? 'Your vote was changed.' : 'Vote counted.');
+      await onChanged();
+    } catch (err) { setError(errorMessage(err, 'Could not save your vote.')); }
+    finally { setBusy(''); }
+  }
+
+  return <>
+    <section className="daily-heading">
+      <div>
+        <span className="eyebrow">{view.group.name}</span>
+        <h1>Daily #{round.number}</h1>
+        <p className="muted">Playing as {view.membership.display_name} · {view.group.member_count} members</p>
+      </div>
+      <div className="daily-streak"><b>{view.streak}</b><span>day streak</span></div>
+    </section>
+    <section className="daily-grid">
+      <article className="daily-main card">
+        <div className="daily-round-meta">
+          <span className={`phase-chip daily-state ${round.state.toLowerCase()}`}>{dailyStateLabel(round.state)}</span>
+          <Deadline deadline={deadline} prefix={round.state === 'OPEN_FOR_SUBMISSIONS' ? 'Reveal' : 'Voting closes'} />
+        </div>
+        <div className="prompt-card daily-prompt"><span className="prompt-label">Today’s prompt</span><p>{round.prompt}</p></div>
+        {round.state === 'OPEN_FOR_SUBMISSIONS' && <div className="daily-compose">
+          <label htmlFor="daily-answer">Your punchline</label>
+          <textarea id="daily-answer" className="field" maxLength={160} rows={4} value={answer}
+            onChange={(event) => setAnswer(event.target.value)} placeholder="Write the line that makes the group lose it…" />
+          <div className="compose-footer"><span>{answer.length}/160</span>
+            <button className="btn primary" disabled={!answer.trim() || !!busy} onClick={submit}>
+              {busy === 'submit' ? 'Saving…' : round.my_submission ? 'Update answer' : 'Lock in answer'}
+            </button>
+          </div>
+          <p className="muted small">Answers stay private until reveal. You can edit yours before the deadline.</p>
+        </div>}
+        {round.state === 'REVEALED_FOR_VOTING' && <DailyVoting round={round} busy={busy} onVote={vote} />}
+        {round.state === 'FINALIZED' && <DailyResults round={round} streak={view.streak} groupName={view.group.name} setNotice={setNotice} />}
+        {error && <p className="err" role="alert">{error}</p>}
+      </article>
+      <aside className="daily-side">
+        <section className="card daily-progress">
+          <h3>Group progress</h3>
+          <b>{round.submission_count}/{round.member_count}</b>
+          <span>answers submitted</span>
+          <div className="progress-track"><span style={{ width: `${Math.min(100, (round.submission_count / Math.max(1, round.member_count)) * 100)}%` }} /></div>
+        </section>
+        {previous && <section className="card previous-round">
+          <h3>Previous round</h3>
+          <p>{previous.prompt}</p>
+          {previous.state === 'FINALIZED' ? <DailyResults round={previous} streak={view.streak} groupName={view.group.name} compact setNotice={setNotice} />
+            : <span className="muted small">Results are still being decided.</span>}
+        </section>}
+        <section className="card daily-rules"><h3>How it works</h3><ol><li>Submit before reveal.</li><li>Authors stay hidden while voting.</li><li>Most votes wins; ties share the crown.</li></ol></section>
+      </aside>
+    </section>
+  </>;
+}
+
+function DailyVoting({ round, busy, onVote }) {
+  if (!round.submissions?.length) return <div className="daily-empty"><h2>No answers today</h2><p>The next prompt opens at local midnight.</p></div>;
+  return <section className="daily-voting"><h2>Vote for the funniest</h2><p className="muted">Authors stay hidden until the result. You can change your vote before close.</p>
+    <div className="daily-submissions">{round.submissions.map((submission) => <button key={submission.id}
+      className={`daily-submission ${submission.my_vote ? 'selected' : ''}`} disabled={submission.mine || !!busy}
+      onClick={() => onVote(submission.id)}>
+      <span>{submission.answer_text}</span><small>{submission.mine ? 'Your answer' : submission.my_vote ? 'Your vote' : 'Vote'}</small>
+    </button>)}</div>
+  </section>;
+}
+
+function DailyResults({ round, streak, groupName, compact = false, setNotice }) {
+  const winners = (round.submissions || []).filter((item) => item.winner);
+  if (!round.submissions?.length) return <p className="muted">No answers were submitted.</p>;
+  return <section className={`daily-results ${compact ? 'compact' : ''}`}>
+    {!compact && <><h2>{winners.length ? (winners.length > 1 ? 'It’s a tie' : `${winners[0].author_name} wins`) : 'No votes this round'}</h2>
+      <p className="muted">The group has spoken.</p></>}
+    <div className="result-list">{round.submissions.map((submission) => <div className={`result-row ${submission.winner ? 'winner' : ''}`} key={submission.id}>
+      <span><b>{submission.answer_text}</b><small>{submission.author_name}</small></span>
+      <strong>{submission.vote_count} {submission.vote_count === 1 ? 'vote' : 'votes'}</strong>
+    </div>)}</div>
+    <button className="btn ghost block" onClick={() => downloadDailyShareCard(round, streak, groupName, setNotice)}>Download spoiler-safe share card</button>
+  </section>;
+}
+
+function Deadline({ deadline, prefix }) {
+  const seconds = useCountdown(deadline);
+  const label = seconds <= 0 ? 'Updating…' : formatDuration(seconds);
+  return <span className="daily-deadline">{prefix} in <b>{label}</b></span>;
+}
+
+function formatDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${Math.max(1, minutes)}m`;
+}
+
+function dailyStateLabel(state) {
+  return { OPEN_FOR_SUBMISSIONS: 'Submissions open', REVEALED_FOR_VOTING: 'Voting open', FINALIZED: 'Final result' }[state] || state;
+}
+
+function downloadDailyShareCard(round, streak, groupName, setNotice) {
+  const winners = (round.submissions || []).filter((item) => item.winner).map((item) => item.author_name);
+  const winnerText = winners.length ? winners.join(' + ') : 'No winner';
+  const canvas = document.createElement('canvas');
+  canvas.width = 1200; canvas.height = 1200;
+  const context = canvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, 1200, 1200);
+  gradient.addColorStop(0, '#ff6b4a'); gradient.addColorStop(1, '#20c7a8');
+  context.fillStyle = '#101114'; context.fillRect(0, 0, 1200, 1200);
+  context.fillStyle = gradient; context.fillRect(70, 70, 1060, 14);
+  context.fillStyle = '#f6c85f'; context.font = '700 34px system-ui'; context.fillText(groupName.toUpperCase(), 90, 180);
+  context.fillStyle = '#f4f4f7'; context.font = '800 104px system-ui'; context.fillText(`DAILY #${round.number}`, 90, 330);
+  context.fillStyle = '#a6abb7'; context.font = '600 42px system-ui'; context.fillText('WINNER', 90, 460);
+  context.fillStyle = '#f4f4f7'; context.font = '800 76px system-ui'; wrapCanvasText(context, winnerText, 90, 565, 980, 90);
+  context.fillStyle = '#20c7a8'; context.font = '800 56px system-ui'; context.fillText(`${streak} DAY GROUP STREAK`, 90, 900);
+  context.fillStyle = '#a6abb7'; context.font = '600 36px system-ui'; context.fillText('Answers hidden. Come play tomorrow.', 90, 990);
+  context.fillStyle = gradient; context.font = '800 52px system-ui'; context.fillText('PUNCHLINE', 90, 1090);
+  const link = document.createElement('a');
+  link.download = `punchline-daily-${round.number}.png`; link.href = canvas.toDataURL('image/png'); link.click();
+  setNotice('Spoiler-safe share card downloaded.');
+}
+
+function wrapCanvasText(context, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(' '); let line = '';
+  for (const word of words) {
+    const test = `${line}${word} `;
+    if (context.measureText(test).width > maxWidth && line) { context.fillText(line.trim(), x, y); line = `${word} `; y += lineHeight; }
+    else line = test;
+  }
+  context.fillText(line.trim(), x, y);
 }
 
 createRoot(document.getElementById('root')).render(<App />);

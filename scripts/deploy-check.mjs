@@ -55,6 +55,21 @@ function runSmoke() {
   });
 }
 
+function runDailySmoke() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['scripts/smoke-daily.mjs', baseURL], {
+      cwd: repoRoot,
+      stdio: 'inherit',
+      env: process.env,
+    });
+    child.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`daily smoke exited with ${code}`));
+    });
+    child.on('error', reject);
+  });
+}
+
 try {
   if (!apiOnly) {
     const app = await checkAppShell();
@@ -73,6 +88,9 @@ try {
     'punchline_instance_draining',
     'punchline_registry_operations_total',
     'punchline_go_heap_alloc_bytes',
+    'punchline_daily_actions_total',
+    'punchline_daily_worker_errors_total',
+    'punchline_daily_worker_last_success_unixtime',
   ]) {
     if (!metrics.text.includes(needle)) {
       throw new Error(`/metrics did not include ${needle}`);
@@ -81,6 +99,9 @@ try {
   console.log(JSON.stringify({ check: 'metrics', ok: true, ms: metrics.ms }));
 
   await runSmoke();
+  if (!apiOnly || truthy(process.env.PUNCHLINE_CHECK_DAILY)) {
+    await runDailySmoke();
+  }
   console.log(JSON.stringify({ check: 'deploy', ok: true, target: baseURL }));
 } catch (err) {
   console.error(JSON.stringify({ check: 'deploy', ok: false, target: baseURL, error: err.message }));

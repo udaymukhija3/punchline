@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/daily"
 	"punchline/backend/internal/httpapi"
 	"punchline/backend/internal/realtime"
 	"punchline/backend/internal/roomstore"
@@ -42,7 +43,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load seed deck %s: %v", deckPath, err)
 	}
-	registry, stateStore, cleanup := roomRegistry()
+	registry, stateStore, db, cleanup := roomRegistry()
 	defer cleanup()
 
 	manager := realtime.NewRoomManager(
@@ -59,7 +60,12 @@ func main() {
 	manager.StartStatePersistence(stateCtx)
 	manager.StartHeartbeat(ctx, heartbeatInterval)
 	manager.StartJanitor(ctx, time.Minute)
-	handler := httpapi.NewHandler(manager)
+	dailyService := daily.UnavailableService()
+	if db != nil {
+		dailyService = daily.NewService(db, deck)
+	}
+	handler := httpapi.NewHandler(manager, dailyService)
+	handler.StartDailyWorker(ctx, getenvDuration("DAILY_WORKER_INTERVAL", time.Minute))
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -138,13 +144,13 @@ func instanceID() string {
 	return "local"
 }
 
-func roomRegistry() (realtime.RoomRegistry, realtime.RoomStateStore, func()) {
+func roomRegistry() (realtime.RoomRegistry, realtime.RoomStateStore, *sql.DB, func()) {
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if databaseURL == "" {
 		if truthy(os.Getenv("PUNCHLINE_REQUIRE_DATABASE")) {
 			log.Fatal("DATABASE_URL is required when PUNCHLINE_REQUIRE_DATABASE is enabled")
 		}
-		return realtime.NewMemoryRoomRegistry(), realtime.NewMemoryRoomStateStore(), func() {}
+		return realtime.NewMemoryRoomRegistry(), realtime.NewMemoryRoomStateStore(), nil, func() {}
 	}
 
 	db, err := sql.Open("pgx", databaseURL)
@@ -164,7 +170,7 @@ func roomRegistry() (realtime.RoomRegistry, realtime.RoomStateStore, func()) {
 		log.Fatalf("connect postgres room registry: %v", err)
 	}
 	store := roomstore.NewPostgresRoomRegistry(db)
-	return store, store, func() { _ = db.Close() }
+	return store, store, db, func() { _ = db.Close() }
 }
 
 func truthy(value string) bool {

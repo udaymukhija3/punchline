@@ -9,6 +9,31 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U punchline -d punchline"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: .
+    command: ["/app/migrate"]
+    environment:
+      DATABASE_URL: postgres://punchline:punchline@postgres:5432/punchline?sslmode=disable
+      PUNCHLINE_REQUIRE_DATABASE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://punchline:punchline@postgres:5432/punchline?sslmode=disable
+      PUNCHLINE_REQUIRE_DATABASE: "true"
+      PUNCHLINE_ALLOWED_ORIGINS: http://localhost:8080
+      DAILY_WORKER_INTERVAL: 5s
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 volumes:
   pgdata:

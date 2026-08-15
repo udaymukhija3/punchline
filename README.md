@@ -1,18 +1,19 @@
 # Punchline
 
-Punchline is a web-first, real-time multiplayer fill-in-the-blank party game.
-Players create a live room, share a 4-character code or invite link, and play
-from any phone or browser without installing an app.
+Punchline is a web-first fill-in-the-blank party game with two rhythms: live
+rooms for game night and durable daily groups for asynchronous play. Players
+can open either mode from a phone or browser without installing an app.
 
 It is also a backend systems project: a server-authoritative Go game engine,
 custom WebSocket transport, reconnectable guest sessions, a mobile-first React
-client, a single-container production build, and an optional Postgres-backed
-room ownership registry for multi-machine routing.
+client, a single-container production build, and a Postgres-backed daily store
+plus room ownership registry for multi-machine routing.
 
 ## Current state
 
-This repository currently ships a playable v0 live game. It is not yet the full
-long-term platform described in some planning docs under `artifacts/`.
+This repository ships a playable live game and a v1 daily/async loop. It is not
+yet the full long-term platform described in some planning docs under
+`artifacts/`.
 
 What works today:
 
@@ -41,15 +42,24 @@ What works today:
   queues, idle-room eviction, and local room caps.
 - Validate the runtime with Go tests, a frontend production build, a Docker
   build, and `scripts/smoke-realtime.mjs`.
+- Create or join a durable daily friend group with a six-character invite code
+  and a browser-held membership token that is hashed in Postgres.
+- Receive one timezone-aware prompt per group/day, edit an answer until the
+  reveal, vote anonymously, then see winners, vote totals, and group streaks.
+- Run deadline transitions safely from every app machine. Postgres constraints,
+  row locks, and idempotent upserts prevent duplicate rounds and retry damage.
+- Generate a spoiler-safe daily result PNG that includes only the round number,
+  winner name, and streak—not the submitted answers.
 
 What is not shipped yet:
 
-- Persistent accounts, user profiles, match history, or durable game results.
+- Persistent accounts, user profiles, live match history, or durable live-game
+  results. Daily group rounds and results are durable.
 - Runtime database-backed card/deck loading. The current game loads
   `seed/cards.json` at startup; the SQL schema and planning docs include future
   content tables.
-- Async daily mode, public content packs, moderation workflow, reporting UI, or
-  AI-assisted card generation.
+- Public content packs, moderation workflow, reporting UI, or AI-assisted card
+  generation.
 - Payments, app-store mobile clients, or a permanent hosted production URL in
   this repo.
 
@@ -60,8 +70,8 @@ resume blurb, recruiter note, or another AI agent.
 
 Good one-line summary:
 
-> Punchline is a production-leaning real-time multiplayer party game built with
-> Go, WebSockets, React, Docker, and optional Postgres room ownership routing.
+> Punchline is a production-leaning live and asynchronous multiplayer party
+> game built with Go, WebSockets, React, Docker, and Postgres.
 
 Accurate bullets:
 
@@ -74,6 +84,9 @@ Accurate bullets:
 - Added production-oriented deployment hardening: one-container API/WS/UI
   runtime, health/readiness probes, security headers, origin checks, Docker/CI,
   Postgres-backed room snapshots, owner leases, and Fly.io replay routing.
+- Built a transactional daily engine with timezone-aware rounds, multi-instance
+  deadline workers, scoped guest authorization, anonymous voting, idempotent
+  mutations, database invariants, streaks, and spoiler-safe sharing.
 
 Evidence map: `docs/RECRUITER_EVIDENCE.md`.
 
@@ -82,13 +95,14 @@ README:
 
 - Do not call it a Next.js or TypeScript app. The current frontend is Vite +
   React JavaScript.
-- Do not claim persistent match history or zero-downtime recovery from every
+- Do not claim persistent live match history or zero-downtime recovery from every
   failure. Active rooms recover from Postgres snapshots after graceful release
   or lease expiry, while guest sessions remain browser-local.
-- Do not claim persistent accounts, match history, durable game results, or
-  database-backed deck serving.
-- Do not claim the async daily mode, moderation workflow, reporting UI, or
-  AI-assisted content pipeline is live. Those are planning/backlog surfaces.
+- Do not claim persistent accounts, live match history, durable live results,
+  or database-backed deck serving. Daily mode has durable group-scoped guest
+  memberships and results, not accounts.
+- Do not claim the moderation workflow, reporting UI, or AI-assisted content
+  pipeline is live. Those remain planning/backlog surfaces.
 - Do not infer shipped behavior only from `artifacts/`; verify against
   `backend/`, `frontend/`, tests, Docker, and the smoke script.
 
@@ -106,10 +120,10 @@ README:
 ## Tech stack
 
 - Backend: Go 1.24, `net/http`, custom WebSocket implementation, in-memory room
-  actors, optional Postgres registry via `github.com/jackc/pgx/v5`.
+  actors, and Postgres via `github.com/jackc/pgx/v5` for production durability.
 - Frontend: Vite, React 19, plain JavaScript, mobile-first responsive UI.
-- Data: `seed/cards.json` for current gameplay; Postgres migrations for room
-  ownership leases and future content/game tables.
+- Data: `seed/cards.json` for prompt selection and live cards; Postgres for room
+  leases/snapshots and durable daily groups, rounds, submissions, votes/results.
 - Runtime: multi-stage Docker image that builds the frontend and serves API,
   WebSockets, and static UI from one Go process.
 - Deployment target: Fly.io config is included, but any container host with
@@ -123,7 +137,7 @@ docs/        Recruiter-facing evidence map for shipped capabilities
 frontend/    Vite + React client with reconnecting guest sessions
 migrations/  Postgres schema, including room ownership lease columns
 seed/        Prompt and answer card seed deck loaded by the server at startup
-scripts/     End-to-end real-time smoke test
+scripts/     End-to-end live and daily smoke/deploy gates
 Dockerfile   Multi-stage API + UI production image
 fly.toml     Fly.io deployment config
 artifacts/   Product, architecture, and future-platform planning docs
@@ -139,6 +153,9 @@ For implementation truth, start with:
 - `backend/internal/realtime/registry.go`: shared registry interface and memory
   implementation.
 - `backend/internal/roomstore/postgres.go`: Postgres room ownership registry.
+- `backend/internal/daily/service.go`: daily identity, persistence, privacy,
+  state transitions, idempotent actions, results, and worker.
+- `backend/internal/httpapi/daily.go`: daily REST authorization and contracts.
 - `backend/internal/httpapi/handler.go`: REST API, WebSocket attach path,
   `Fly-Replay`, CORS, security headers.
 - `backend/internal/ws/ws.go`: custom server-side WebSocket implementation.
@@ -167,24 +184,26 @@ npm run dev
 Open `http://localhost:5173`. Vite proxies `/api` and `/ws` to the backend on
 `:8080`.
 
-## Optional Postgres room registry
+## Postgres-backed daily mode and room registry
 
 Local dev works without a database. Without `DATABASE_URL`, the server uses an
-in-memory room registry and should run as one process.
+in-memory live-room registry and should run as one process. Daily mode is
+intentionally unavailable because its product contract is durable; use
+Postgres to develop or demo `/daily`.
 
 With `DATABASE_URL`, the server reserves each room code in Postgres with an
 owning `instance_id`, heartbeat timestamp, and expiry:
 
 ```bash
-docker compose up -d postgres
+docker compose run --rm migrate
 export DATABASE_URL=postgres://punchline:punchline@localhost:5432/punchline?sslmode=disable
 cd backend
 go run ./cmd/api
 ```
 
-Fresh Docker Compose databases apply `migrations/` automatically. Existing
-databases must run the migration runner before turning on `DATABASE_URL`;
-`migrations/003_room_state_snapshots.sql` adds active-room recovery.
+Docker Compose runs the same checksum-guarded `/app/migrate` binary used by the
+production release. Existing databases must run that migration runner before
+the new image starts; `004_daily_async.sql` is additive.
 
 Useful registry env vars:
 
@@ -196,16 +215,16 @@ ROOM_LEASE_TTL              Active-room lease duration, default 90s.
 ROOM_HEARTBEAT_INTERVAL     Lease heartbeat interval, default 15s.
 DB_MAX_OPEN_CONNS           Postgres pool cap, default 10.
 DB_MAX_IDLE_CONNS           Postgres idle pool cap, default 5.
+DAILY_WORKER_INTERVAL       Daily transition scan interval, default 1m.
 ```
 
 ## Run the production image locally
 
-The container builds the frontend, compiles the Go server, and serves
-everything from one origin:
+Docker Compose builds the container, starts Postgres, runs release migrations,
+and serves everything from one origin:
 
 ```bash
-docker build -t punchline .
-docker run -p 8080:8080 punchline
+docker compose up --build -d app
 ```
 
 Open `http://localhost:8080`.
@@ -217,9 +236,8 @@ node scripts/deploy-check.mjs http://localhost:8080
 ```
 
 The check verifies the React app shell and built assets, `/readyz`, `/metrics`,
-then creates a room, joins three players, opens three authenticated WebSockets,
-starts a round, submits answers, picks a winner, advances the next round,
-checks judge rotation, and prints phase-transition timings.
+the complete live WebSocket round, and the daily create/join/today/submit/privacy
+flow. Its temporary daily group is deleted at the end.
 
 ## Demo deployment checklist
 
@@ -234,13 +252,12 @@ npm run build
 
 cd ..
 docker build -t punchline .
+node --check scripts/smoke-daily.mjs
 ```
 
-Run the production image locally:
-
-```bash
-docker run --rm -p 8080:8080 punchline
-```
+Run the production image locally with `docker compose up --build -d app`; the
+daily engine deliberately does not start in memory-only mode. See
+`docs/DEPLOYMENT.md` for the exact production-shaped local and Fly flows.
 
 Open `http://localhost:8080`, create a room, join from two more tabs or
 phones, start a round, submit answers, pick a winner, and advance to the next
@@ -256,7 +273,9 @@ node scripts/deploy-check.mjs http://localhost:8080
 
 This is the quickest free path to a shareable URL for the current demo. It
 deploys the existing Dockerfile as one Render web service using `render.yaml`.
-No database is required for a single-instance demo.
+No database is required for a live-room-only single-instance demo. The `/daily`
+route will report that Postgres is required, so use Fly or attach managed
+Postgres before presenting both modes.
 
 1. Push this repo to GitHub.
 2. In Render, click **New** > **Blueprint**.
@@ -330,6 +349,7 @@ npm run build
 cd ..
 docker build -t punchline .
 node scripts/smoke-realtime.mjs http://localhost:8080
+node scripts/smoke-daily.mjs http://localhost:8080
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs backend vet/build/tests,
@@ -344,6 +364,12 @@ POST /api/rooms                 -> room snapshot
 POST /api/rooms/{code}/join     -> { player, token, room }
 GET  /api/rooms/{code}          -> room snapshot
 GET  /ws/rooms/{code}?player_id=...&token=...   WebSocket
+POST /api/daily/groups                  -> { group, membership, token }
+POST /api/daily/groups/{code}/join      -> { group, membership, token }
+GET  /api/daily/groups/{code}/today     -> today, previous result, streak
+POST /api/daily/rounds/{id}/submit      -> idempotent create/update
+POST /api/daily/rounds/{id}/vote        -> idempotent create/change
+DELETE /api/daily/groups/{code}         -> owner-only cascade delete
 ```
 
 Client WebSocket messages:
@@ -383,6 +409,6 @@ judging.
 
 ## Roadmap
 
-Likely next slices are persistent results, accounts, DB-backed deck
-loading, content moderation/reporting, async daily rooms, and a public hosted
-demo that matches the exact runtime described here.
+Likely next slices are persistent live results, optional cross-device accounts,
+DB-backed deck loading, content moderation/reporting, notifications, and a
+public hosted demo that matches the exact runtime described here.

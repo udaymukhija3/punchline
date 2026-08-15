@@ -12,13 +12,14 @@ Start with this file, then read:
 ## Current Production Shape
 
 - One Go container serves the React bundle, HTTP API, WebSockets, health,
-  readiness, and Prometheus-style metrics.
+  readiness, Prometheus-style metrics, and the Postgres-backed daily worker.
 - Fly.io is the production-shaped deploy target. `fly.toml` runs `/app/migrate`
   as the release command and probes `/readyz`.
 - Postgres is required for production. It stores room ownership leases and
   durable active-room snapshots.
 - Without `DATABASE_URL`, the app is local/demo only and uses memory-backed room
-  ownership/state.
+- Daily groups, memberships, rounds, submissions, votes, results, and streaks
+  are durable in Postgres. Daily mode returns `503` without `DATABASE_URL`.
 - Active rooms can recover from Postgres snapshots after graceful release or
   after an ungraceful owner's `ROOM_LEASE_TTL` expires. This is not a
   zero-downtime guarantee.
@@ -36,7 +37,8 @@ Start with this file, then read:
   limits, slow-socket protection, and stricter WebSocket protocol validation.
 - Local rate limits with explicit trusted-proxy client IP handling.
 - CI now includes backend vet/build/test/race, frontend build, Docker build, and
-  a Postgres-backed realtime smoke job.
+- Async daily engine: `backend/internal/daily/`, `migrations/004_daily_async.sql`,
+  `backend/internal/httpapi/daily.go`, and `scripts/smoke-daily.mjs`.
 
 ## Infrastructure Necessity Decisions
 
@@ -109,8 +111,9 @@ node scripts/deploy-check.mjs http://127.0.0.1:18081
 
 ## Watch Outs
 
-- Do not claim persistent accounts, match history, durable game results, or
-  database-backed deck serving. Those are not shipped.
+- Do not claim persistent accounts, live match history, durable live-game
+  results, or database-backed deck serving. Daily identities are scoped guest
+  memberships whose bearer tokens stay in the joining browser.
 - Do not claim zero-downtime recovery. Graceful deploy recovery is immediate;
   ungraceful owner failure waits up to `ROOM_LEASE_TTL`.
 - Do not trust forwarded client IP headers by default. The app deliberately uses
