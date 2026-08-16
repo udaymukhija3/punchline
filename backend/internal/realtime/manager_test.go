@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -325,4 +326,103 @@ func TestManagerRecordsRegistryOperationStats(t *testing.T) {
 			t.Fatalf("missing registry metric %s in %+v", key, stats)
 		}
 	}
+}
+
+// Moderation used to be invisible to a running server: the deck was read once
+// at boot, so a card retired at the admin desk (or auto-retired at three
+// reporters) kept being dealt until the next deploy.
+func TestSetDeckAppliesToNewRoomsOnly(t *testing.T) {
+	before := cards.Deck{
+		Prompts: []cards.PromptCard{{ID: "p_old", Text: "old prompt ____.", Tier: cards.TierParty}},
+		Answers: []cards.AnswerCard{{ID: "a_old", Text: "the old answer", Tier: cards.TierParty}},
+	}
+	manager := NewRoomManager(before)
+	established, err := manager.CreateRoom(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	after := cards.Deck{
+		Prompts: []cards.PromptCard{{ID: "p_new", Text: "new prompt ____.", Tier: cards.TierParty}},
+		Answers: []cards.AnswerCard{{ID: "a_new", Text: "the new answer", Tier: cards.TierParty}},
+	}
+	if !manager.SetDeck(after) {
+		t.Fatal("SetDeck reported no change for a different deck")
+	}
+	if manager.SetDeck(after) {
+		t.Fatal("SetDeck reported a change for an identical deck")
+	}
+
+	fresh, err := manager.CreateRoom(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newcomer := fresh.Join("Newcomer")
+	for _, card := range newcomer.Hand {
+		if card.ID != "a_new" {
+			t.Fatalf("new room dealt %q; want only cards from the refreshed deck", card.ID)
+		}
+	}
+	// The established room keeps the pile its players were dealt from.
+	returning := established.Join("Returning")
+	for _, card := range returning.Hand {
+		if card.ID != "a_old" {
+			t.Fatalf("established room dealt %q; want its original deck", card.ID)
+		}
+	}
+}
+
+// An unplayable deck is far more likely to be a bad query than an empty pack,
+// and swapping one in would leave every new room undealable.
+func TestSetDeckRejectsUnplayableDecks(t *testing.T) {
+	manager := NewRoomManager(cards.NewSeedDeck())
+	for _, tc := range []struct {
+		label string
+		deck  cards.Deck
+	}{
+		{"empty", cards.Deck{}},
+		{"prompts only", cards.Deck{Prompts: []cards.PromptCard{{ID: "p", Text: "x ____."}}}},
+		{"answers only", cards.Deck{Answers: []cards.AnswerCard{{ID: "a", Text: "x"}}}},
+	} {
+		if manager.SetDeck(tc.deck) {
+			t.Fatalf("%s deck was accepted", tc.label)
+		}
+	}
+	room, err := manager.CreateRoom(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(room.Join("Player").Hand) == 0 {
+		t.Fatal("rooms became undealable after a rejected deck swap")
+	}
+}
+
+// The refresher runs while rooms are being created.
+func TestSetDeckIsSafeUnderConcurrentRoomCreation(t *testing.T) {
+	manager := NewRoomManager(cards.NewSeedDeck())
+	decks := []cards.Deck{
+		cards.NewSeedDeck(),
+		{
+			Prompts: []cards.PromptCard{{ID: "p_a", Text: "a ____.", Tier: cards.TierParty}},
+			Answers: []cards.AnswerCard{{ID: "a_a", Text: "a", Tier: cards.TierParty}},
+		},
+		{
+			Prompts: []cards.PromptCard{{ID: "p_b", Text: "b ____.", Tier: cards.TierParty}},
+			Answers: []cards.AnswerCard{{ID: "a_b", Text: "b", Tier: cards.TierParty}},
+		},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func(n int) { defer wg.Done(); manager.SetDeck(decks[n%len(decks)]) }(i)
+		go func() {
+			defer wg.Done()
+			room, err := manager.CreateRoom(context.Background())
+			if err != nil {
+				return
+			}
+			room.Join("Racer")
+		}()
+	}
+	wg.Wait()
 }

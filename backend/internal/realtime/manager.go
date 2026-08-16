@@ -282,8 +282,32 @@ func (m *RoomManager) loadRoomState(ctx context.Context, code string) (Persisted
 	return state, err
 }
 
+// SetDeck swaps the deck dealt to rooms created from here on. Rooms already in
+// play keep the deck they started with: their piles, hands, and current prompt
+// were drawn from it, and pulling a card out from under a round in progress
+// would be a worse bug than dealing one retired card for one more game.
+// Reports the swap so a caller can log a real content change.
+func (m *RoomManager) SetDeck(deck cards.Deck) bool {
+	if !deck.Playable() {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deck.Fingerprint() == deck.Fingerprint() {
+		return false
+	}
+	m.deck = deck
+	return true
+}
+
+func (m *RoomManager) currentDeck() cards.Deck {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.deck
+}
+
 func (m *RoomManager) installRestoredRoom(code string, state PersistedRoomState) (*Room, error) {
-	room, err := RestoreRoom(state, m.deck)
+	room, err := RestoreRoom(state, m.currentDeck())
 	if err != nil {
 		return nil, err
 	}
