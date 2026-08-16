@@ -175,7 +175,7 @@ func TestStartComputerGameAddsComputerPlayersAndUsesRealLoop(t *testing.T) {
 	}
 }
 
-func TestTryJoinRejectsFullOrStartedRoom(t *testing.T) {
+func TestTryJoinRejectsFullRoomAtAnyPhase(t *testing.T) {
 	r := newTestRoom()
 	host := r.Join("Alice")
 	r.Join("Bob")
@@ -188,12 +188,21 @@ func TestTryJoinRejectsFullOrStartedRoom(t *testing.T) {
 		t.Fatalf("err = %v, want ErrRoomFull", err)
 	}
 
+	// A started game no longer refuses arrivals -- see
+	// TestLateJoinerPlaysFromTheNextRound -- but a full one still does, at any
+	// phase.
 	r.maxPlayers = 12
 	if err := r.StartGame(host.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.TryJoin("Eve"); !errors.Is(err, ErrRoomAlreadyStarted) {
-		t.Fatalf("err = %v, want ErrRoomAlreadyStarted", err)
+	if _, err := r.TryJoin("Eve"); err != nil {
+		t.Fatalf("late join = %v, want success", err)
+	}
+	r.mu.Lock()
+	r.maxPlayers = len(r.order)
+	r.mu.Unlock()
+	if _, err := r.TryJoin("Frank"); !errors.Is(err, ErrRoomFull) {
+		t.Fatalf("join into a full started room = %v, want ErrRoomFull", err)
 	}
 }
 
@@ -555,4 +564,246 @@ func TestUndoJoinFreesTheSeat(t *testing.T) {
 	// Undoing an unknown or already-removed player is a no-op, not a panic.
 	room.UndoJoin(ghost.ID)
 	room.UndoJoin("pl_missing")
+}
+
+// Arriving late used to be impossible: a friend who clicked the invite link
+// after the host started got "game already started" and was locked out until
+// the game ended, which is the most common thing that happens at a party.
+func TestLateJoinerPlaysFromTheNextRound(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	room.Join("Two")
+	room.Join("Three")
+	if err := room.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	late, err := room.TryJoin("Latecomer")
+	if err != nil {
+		t.Fatalf("late join = %v, want success", err)
+	}
+	if len(late.Hand) != handSize {
+		t.Fatalf("late joiner got %d cards, want %d", len(late.Hand), handSize)
+	}
+	if late.IsJudge {
+		t.Fatal("a late joiner must not take over judging a round already underway")
+	}
+	snap := room.SnapshotFor(late.ID)
+	if len(snap.Players) != 4 {
+		t.Fatalf("roster = %d, want 4", len(snap.Players))
+	}
+	if snap.Phase != PhaseSubmitting {
+		t.Fatalf("phase = %q, want the round to carry on", snap.Phase)
+	}
+	// They can play the round they walked into.
+	if err := room.SubmitAnswer(late.ID, late.Hand[0].ID); err != nil {
+		t.Fatalf("late joiner could not answer: %v", err)
+	}
+	// And a full room still refuses, whatever the phase.
+	room.mu.Lock()
+	room.maxPlayers = 4
+	room.mu.Unlock()
+	if _, err := room.TryJoin("TooLate"); !errors.Is(err, ErrRoomFull) {
+		t.Fatalf("join into a full room = %v, want ErrRoomFull", err)
+	}
+}
+
+// Leaving used to only drop the socket, so the seat was occupied forever.
+func TestLeaveFreesTheSeatInTheLobby(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	quitter := room.Join("Quitter")
+	room.Join("Three")
+
+	if err := room.Leave(quitter.ID); err != nil {
+		t.Fatal(err)
+	}
+	snap := room.SnapshotFor(host.ID)
+	if len(snap.Players) != 2 {
+		t.Fatalf("roster = %d, want 2 after a leave", len(snap.Players))
+	}
+	for _, p := range snap.Players {
+		if p.Name == "Quitter" {
+			t.Fatal("the player who left is still holding a seat")
+		}
+	}
+	if snap.HostID != host.ID {
+		t.Fatal("an unrelated leave moved the host")
+	}
+	if err := room.Leave(quitter.ID); !errors.Is(err, errNotFound) {
+		t.Fatalf("second leave = %v, want errNotFound", err)
+	}
+}
+
+// The host leaving hands the room to someone still there.
+func TestLeaveMovesTheHost(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	next := room.Join("Next")
+	room.Join("Third")
+	if err := room.Leave(host.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := room.SnapshotFor(next.ID).HostID; got != next.ID {
+		t.Fatalf("host after the host left = %q, want %q", got, next.ID)
+	}
+}
+
+// A round nobody can award is void rather than stuck. The played cards go back
+// to their owners instead of being burned on a round that never scored.
+func TestJudgeLeavingVoidsTheRound(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	two := room.Join("Two")
+	three := room.Join("Three")
+	four := room.Join("Four")
+	if err := room.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+	judgeID := room.SnapshotFor(host.ID).JudgeID
+	answerers := []Player{}
+	for _, p := range []Player{host, two, three, four} {
+		if p.ID != judgeID {
+			answerers = append(answerers, p)
+		}
+	}
+	played := answerers[0]
+	before := len(room.SnapshotFor(played.ID).Players)
+	if err := room.SubmitAnswer(played.ID, played.Hand[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := room.Leave(judgeID); err != nil {
+		t.Fatal(err)
+	}
+	snap := room.SnapshotFor(played.ID)
+	if snap.Phase != PhaseScoring {
+		t.Fatalf("phase after the judge left = %q, want scoring so the host can move on", snap.Phase)
+	}
+	if len(snap.Submissions) != 0 {
+		t.Fatalf("void round kept %d submissions", len(snap.Submissions))
+	}
+	if len(snap.Players) != before-1 {
+		t.Fatalf("roster = %d, want %d", len(snap.Players), before-1)
+	}
+	var mine *Player
+	for i := range snap.Players {
+		if snap.Players[i].ID == played.ID {
+			mine = &snap.Players[i]
+		}
+	}
+	if mine == nil || len(mine.Hand) != handSize {
+		t.Fatalf("played card was not returned; hand = %v", mine)
+	}
+	// Play continues: the next round deals a fresh judge from the survivors.
+	if err := room.NextRound(room.SnapshotFor("").HostID); err != nil {
+		t.Fatalf("next round after a void round = %v", err)
+	}
+	if room.SnapshotFor("").JudgeID == "" {
+		t.Fatal("next round has no judge")
+	}
+}
+
+// The room may have been waiting only on the player who walked out.
+func TestLeavingCompletesAWaitingRound(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	two := room.Join("Two")
+	three := room.Join("Three")
+	if err := room.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+	judgeID := room.SnapshotFor("").JudgeID
+	var waiting, submitted Player
+	for _, p := range []Player{host, two, three} {
+		if p.ID == judgeID {
+			continue
+		}
+		if submitted.ID == "" {
+			submitted = p
+		} else {
+			waiting = p
+		}
+	}
+	if err := room.SubmitAnswer(submitted.ID, submitted.Hand[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := room.SnapshotFor("").Phase; got != PhaseSubmitting {
+		t.Fatalf("phase = %q, want to still be waiting", got)
+	}
+	// Two players left is below the floor, so this also ends the game -- which
+	// is the honest outcome, not a room stuck waiting for someone who left.
+	if err := room.Leave(waiting.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := room.SnapshotFor("").Phase; got != PhaseFinished {
+		t.Fatalf("phase = %q, want finished once the room drops below %d players", got, minPlayersToStart)
+	}
+}
+
+// Dropping below the floor mid-game ends it rather than leaving a room that
+// cannot deal a round.
+func TestLeavingBelowThePlayerFloorEndsTheGame(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	two := room.Join("Two")
+	room.Join("Three")
+	if err := room.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := room.Leave(two.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := room.SnapshotFor(host.ID).Phase; got != PhaseFinished {
+		t.Fatalf("phase = %q, want finished", got)
+	}
+	// The host can still rebuild the table from the game-over screen.
+	if err := room.PlayAgain(room.SnapshotFor("").HostID); err != nil {
+		t.Fatalf("play again after a walkout = %v", err)
+	}
+}
+
+// Judge rotation is an index into the roster, so removing players must not make
+// it skip, repeat, or run off the end.
+func TestJudgeRotationSurvivesDepartures(t *testing.T) {
+	room := newTestRoom()
+	host := room.Join("Host")
+	players := []Player{host, room.Join("B"), room.Join("C"), room.Join("D"), room.Join("E")}
+	if err := room.StartGame(host.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Drop someone who sits before the judge, then someone after.
+	if err := room.Leave(players[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := room.Leave(players[4].ID); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 6; round++ {
+		snap := room.SnapshotFor("")
+		if snap.Phase == PhaseFinished {
+			break
+		}
+		if snap.Phase == PhaseSubmitting || snap.Phase == PhaseJudging {
+			judge := snap.JudgeID
+			if judge != "" && room.SnapshotFor(judge).JudgeID != judge {
+				t.Fatal("judge disagrees with itself between views")
+			}
+			found := false
+			for _, p := range snap.Players {
+				if p.ID == judge {
+					found = true
+				}
+			}
+			if judge != "" && !found {
+				t.Fatalf("round %d judge %q is not in the roster", round, judge)
+			}
+		}
+		room.mu.Lock()
+		room.phase = PhaseScoring
+		room.mu.Unlock()
+		if err := room.NextRound(room.SnapshotFor("").HostID); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
 }
