@@ -458,3 +458,101 @@ func TestJudgeOnlyPickWinnerAndHostOnlyRoundAdvance(t *testing.T) {
 		t.Fatalf("host next round failed: %v", err)
 	}
 }
+
+// A NUL byte in a player name used to reach the roster, where it made the
+// room's state unserializable to Postgres JSONB. Every later join and every
+// later action on that room then failed, unrecoverably, for everyone in it.
+func TestJoinRejectsUnpersistableNames(t *testing.T) {
+	rejected := []struct {
+		label string
+		name  string
+	}{
+		{"nul byte", "Attacker\x00x"},
+		{"nul only", "\x00"},
+		{"bell", "Bo\ab"},
+		{"newline", "line1\nline2"},
+		{"tab", "col1\tcol2"},
+		{"carriage return", "Bob\r"},
+		{"escape", "Bob\x1b[31m"},
+		{"delete", "Bob\x7f"},
+	}
+	for _, tc := range rejected {
+		room := newTestRoom()
+		if _, err := room.TryJoin(tc.name); !errors.Is(err, ErrInvalidName) {
+			t.Fatalf("%s: TryJoin = %v, want ErrInvalidName", tc.label, err)
+		}
+		if got := len(room.SnapshotFor("").Players); got != 0 {
+			t.Fatalf("%s: rejected join left %d players in the roster", tc.label, got)
+		}
+		// The room has to stay usable for the next player through the door.
+		if _, err := room.TryJoin("Innocent"); err != nil {
+			t.Fatalf("%s: legitimate join after rejection = %v", tc.label, err)
+		}
+	}
+
+	accepted := []struct {
+		label string
+		name  string
+	}{
+		{"emoji", "🎉 Sam"},
+		{"zwj family", "👨‍👩‍👧‍👦"},
+		{"accents", "Zoë Ünicode"},
+		{"cjk", "田中さん"},
+		{"rtl override", "Bob‮evil"},
+		{"zero width", "A​B"},
+		{"punctuation", "D'Angelo-Smith (Jr.)"},
+	}
+	for _, tc := range accepted {
+		room := newTestRoom()
+		player, err := room.TryJoin(tc.name)
+		if err != nil {
+			t.Fatalf("%s: TryJoin = %v, want success", tc.label, err)
+		}
+		if player.Name != tc.name {
+			t.Fatalf("%s: stored name = %q, want %q", tc.label, player.Name, tc.name)
+		}
+	}
+}
+
+// Names that are only whitespace, or longer than the roster carries, keep
+// their existing behaviour: normalise, do not reject.
+func TestJoinStillNormalisesEdgeNames(t *testing.T) {
+	room := newTestRoom()
+	blank, err := room.TryJoin("     ")
+	if err != nil || blank.Name != "Guest" {
+		t.Fatalf("whitespace name = (%q, %v), want (\"Guest\", nil)", blank.Name, err)
+	}
+	long, err := room.TryJoin(strings.Repeat("é", 80))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len([]rune(long.Name)); got != maxNameLen {
+		t.Fatalf("long name kept %d runes, want %d", got, maxNameLen)
+	}
+}
+
+// A join that fails after the roster mutation must not hold a seat. The player
+// never receives its guest token, so nothing can ever occupy that seat again.
+func TestUndoJoinFreesTheSeat(t *testing.T) {
+	room := newTestRoom()
+	keep, err := room.TryJoin("Keeper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghost, err := room.TryJoin("Ghost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	room.UndoJoin(ghost.ID)
+
+	snap := room.SnapshotFor("")
+	if len(snap.Players) != 1 || snap.Players[0].Name != "Keeper" {
+		t.Fatalf("roster after undo = %+v, want only Keeper", snap.Players)
+	}
+	if room.SnapshotFor(keep.ID).HostID != keep.ID {
+		t.Fatal("undoing a later join disturbed the host")
+	}
+	// Undoing an unknown or already-removed player is a no-op, not a panic.
+	room.UndoJoin(ghost.ID)
+	room.UndoJoin("pl_missing")
+}
