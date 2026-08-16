@@ -1193,11 +1193,24 @@ function useAdminList(path, token, deps = []) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const latest = useRef(0);
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  // Changing a filter leaves the previous request in flight. Only the newest
+  // one may write state, or a slow response repaints the list for a filter the
+  // admin already left — and an empty stale list reads as "no such card".
   const load = useCallback(async () => {
+    const id = ++latest.current;
+    const current = () => alive.current && id === latest.current;
     setBusy(true); setError('');
-    try { setData(await adminRequest(path, { token })); }
-    catch (err) { setError(errorMessage(err, 'Could not load that queue.')); }
-    finally { setBusy(false); }
+    try {
+      const next = await adminRequest(path, { token });
+      if (current()) setData(next);
+    } catch (err) {
+      if (current()) setError(errorMessage(err, 'Could not load that queue.'));
+    } finally {
+      if (current()) setBusy(false);
+    }
   }, [path, token]);
   useEffect(() => { load(); }, [load, ...deps]);
   return { data, error, busy, reload: load };
@@ -1299,6 +1312,13 @@ function AdminCandidates({ token, onChanged }) {
   );
 }
 
+// Prompts and answers count different things, so each kind gets its own lenses:
+// only prompts track skips, only answers track wins.
+const CARD_SORTS = {
+  answer: [['played', 'Most played'], ['unplayed', 'Least played'], ['winning', 'Most wins'], ['reported', 'Most reported']],
+  prompt: [['played', 'Most played'], ['unplayed', 'Least played'], ['skipped', 'Most skipped'], ['reported', 'Most reported']],
+};
+
 function AdminCards({ token, onChanged }) {
   const [kind, setKind] = useState('answer');
   const [sort, setSort] = useState('played');
@@ -1320,6 +1340,11 @@ function AdminCards({ token, onChanged }) {
     } finally { setActing(''); }
   }
 
+  function changeKind(next) {
+    setKind(next);
+    if (!CARD_SORTS[next].some(([value]) => value === sort)) setSort('played');
+  }
+
   const cards = data?.cards || [];
   const rate = (card) => (card.kind === 'answer'
     ? `${Math.round((card.win_rate || 0) * 100)}% win`
@@ -1330,16 +1355,12 @@ function AdminCards({ token, onChanged }) {
       <div className="admin-queue-head">
         <h2>Cards</h2>
         <div className="admin-filters">
-          <select className="field small" value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Card kind">
+          <select className="field small" value={kind} onChange={(e) => changeKind(e.target.value)} aria-label="Card kind">
             <option value="answer">Answers</option>
             <option value="prompt">Prompts</option>
           </select>
           <select className="field small" value={sort} onChange={(e) => setSort(e.target.value)} aria-label="Sort by">
-            <option value="played">Most played</option>
-            <option value="unplayed">Least played</option>
-            <option value="winning">{kind === 'answer' ? 'Most wins' : 'Most skipped'}</option>
-            <option value="skipped">Most skipped</option>
-            <option value="reported">Most reported</option>
+            {CARD_SORTS[kind].map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
           <select className="field small" value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Status">
             <option value="approved">Live</option>

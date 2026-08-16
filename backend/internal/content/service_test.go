@@ -28,6 +28,37 @@ func TestReportValidation(t *testing.T) {
 	}
 }
 
+// A sort the card's table cannot serve has to be rejected as bad input. The
+// old code handed "skipped" to answer_cards, which has no skip_count, and the
+// admin saw a 503 claiming the content platform was down.
+func TestCardSortIsValidatedPerKind(t *testing.T) {
+	supported := []struct{ kind, sort, want string }{
+		{KindPrompt, "", "c.times_played DESC"},
+		{KindPrompt, "unplayed", "c.times_played ASC"},
+		{KindPrompt, "reported", "c.report_count DESC, c.times_played DESC"},
+		{KindPrompt, "skipped", "c.skip_count DESC"},
+		{KindAnswer, "played", "c.times_played DESC"},
+		{KindAnswer, "winning", "c.win_count DESC"},
+	}
+	for _, tc := range supported {
+		order, err := cardOrder(tc.kind, tc.sort)
+		if err != nil || order != tc.want {
+			t.Fatalf("cardOrder(%q, %q) = %q, %v; want %q", tc.kind, tc.sort, order, err, tc.want)
+		}
+	}
+
+	unsupported := []struct{ kind, sort string }{
+		{KindAnswer, "skipped"},
+		{KindPrompt, "winning"},
+		{KindAnswer, "sideways"},
+	}
+	for _, tc := range unsupported {
+		if _, err := cardOrder(tc.kind, tc.sort); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("cardOrder(%q, %q) = %v; want ErrInvalidInput", tc.kind, tc.sort, err)
+		}
+	}
+}
+
 func testService(t *testing.T) (*Service, *sql.DB, context.Context, func()) {
 	t.Helper()
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -208,6 +239,9 @@ func TestPostgresCardBrowserSortsAndFilters(t *testing.T) {
 	}
 	if _, err := s.Cards(ctx, KindAnswer, "", "sideways", 10); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("bad sort = %v", err)
+	}
+	if _, err := s.Cards(ctx, KindAnswer, "approved", "skipped", 10); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("answers sorted by skips = %v", err)
 	}
 	cards, err := s.Cards(ctx, KindAnswer, "approved", "played", 10)
 	if err != nil {

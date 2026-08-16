@@ -283,7 +283,7 @@ func (s *Service) ReviewCandidate(ctx context.Context, candidateID, decision, ti
 
 // Cards lists cards for the admin browser. sort selects the curation lens:
 // "reported" surfaces complaints, "skipped" and "unplayed" surface duds,
-// "winning" surfaces keepers.
+// "winning" surfaces keepers. Not every lens fits both kinds; see cardOrder.
 func (s *Service) Cards(ctx context.Context, kind, status, sort string, limit int) ([]Card, error) {
 	if !s.Available() {
 		return nil, ErrUnavailable
@@ -308,20 +308,9 @@ func (s *Service) Cards(ctx context.Context, kind, status, sort string, limit in
 	if kind == KindAnswer {
 		table, performance = "answer_cards", "c.win_count"
 	}
-	order := "c.times_played DESC"
-	switch sort {
-	case "", "played":
-		order = "c.times_played DESC"
-	case "reported":
-		order = "c.report_count DESC, c.times_played DESC"
-	case "unplayed":
-		order = "c.times_played ASC"
-	case "skipped":
-		order = "c.skip_count DESC"
-	case "winning":
-		order = performance + " DESC"
-	default:
-		return nil, ErrInvalidInput
+	order, err := cardOrder(kind, sort)
+	if err != nil {
+		return nil, err
 	}
 
 	query := fmt.Sprintf(`
@@ -360,6 +349,31 @@ func (s *Service) Cards(ctx context.Context, kind, status, sort string, limit in
 		out = append(out, card)
 	}
 	return out, rows.Err()
+}
+
+// cardOrder resolves a curation lens to an ORDER BY clause. The two card
+// tables count different things — only prompt_cards has skip_count, only
+// answer_cards has win_count — so a lens the kind cannot serve is a bad
+// request. Letting it reach Postgres turns a typo into a 503 that reads as an
+// outage.
+func cardOrder(kind, sort string) (string, error) {
+	switch sort {
+	case "", "played":
+		return "c.times_played DESC", nil
+	case "unplayed":
+		return "c.times_played ASC", nil
+	case "reported":
+		return "c.report_count DESC, c.times_played DESC", nil
+	case "skipped":
+		if kind == KindPrompt {
+			return "c.skip_count DESC", nil
+		}
+	case "winning":
+		if kind == KindAnswer {
+			return "c.win_count DESC", nil
+		}
+	}
+	return "", ErrInvalidInput
 }
 
 // SetCardStatus retires or restores a card directly from the browser.
