@@ -207,6 +207,10 @@ func (h *Handler) computerRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	player, err := room.TryJoin(req.Name)
 	if err != nil {
+		if errors.Is(err, realtime.ErrInvalidName) {
+			writeError(w, http.StatusBadRequest, "that name has characters we can't use — try letters and numbers")
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "could not join room")
 		return
 	}
@@ -267,10 +271,17 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, "game already started")
 				return
 			}
+			if errors.Is(err, realtime.ErrInvalidName) {
+				writeError(w, http.StatusBadRequest, "that name has characters we can't use — try letters and numbers")
+				return
+			}
 			writeError(w, http.StatusServiceUnavailable, "could not join room")
 			return
 		}
 		if err := h.manager.PersistRoom(r.Context(), room); err != nil {
+			// The client never learns this player's guest token, so the seat
+			// would be held by someone who can never connect.
+			room.UndoJoin(player.ID)
 			log.Printf("persist joined room: %v", err)
 			writeError(w, http.StatusServiceUnavailable, "could not save room")
 			return

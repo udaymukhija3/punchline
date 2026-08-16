@@ -493,3 +493,72 @@ func TestAdminAuthFailuresAreRateLimited(t *testing.T) {
 		t.Fatalf("guesses past the limit = %v, want 429s", statuses)
 	}
 }
+
+// A name the room cannot persist is a bad request, not a server fault, and it
+// must not disturb the room. Before this was fixed, the join was accepted into
+// the roster and the room's Postgres snapshot broke permanently: every later
+// join returned 503 and every later action returned "could not save room
+// state" for everyone already playing.
+func TestJoinWithControlCharactersIsRejectedAndLeavesTheRoomHealthy(t *testing.T) {
+	handler := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck()))
+	server := httptest.NewServer(handler.Routes())
+	defer server.Close()
+
+	createResp, err := http.Post(server.URL+"/api/rooms", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+	var created struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	join := func(name string) int {
+		payload, err := json.Marshal(map[string]string{"name": name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(server.URL+"/api/rooms/"+created.Code+"/join", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := join("Victim"); got != http.StatusCreated {
+		t.Fatalf("first join status = %d, want %d", got, http.StatusCreated)
+	}
+	if got := join("Attacker\x00x"); got != http.StatusBadRequest {
+		t.Fatalf("control-character join status = %d, want %d", got, http.StatusBadRequest)
+	}
+	// The room used to be dead from here on.
+	if got := join("Carol"); got != http.StatusCreated {
+		t.Fatalf("join after rejected name = %d, want %d", got, http.StatusCreated)
+	}
+
+	roomResp, err := http.Get(server.URL + "/api/rooms/" + created.Code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roomResp.Body.Close()
+	var snapshot struct {
+		Players []struct {
+			Name string `json:"name"`
+		} `json:"players"`
+	}
+	if err := json.NewDecoder(roomResp.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Players) != 2 {
+		t.Fatalf("roster = %+v, want exactly Victim and Carol", snapshot.Players)
+	}
+	for _, p := range snapshot.Players {
+		if strings.ContainsRune(p.Name, 0) {
+			t.Fatalf("roster kept an unpersistable name: %q", p.Name)
+		}
+	}
+}
