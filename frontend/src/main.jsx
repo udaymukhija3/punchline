@@ -69,6 +69,22 @@ function LiveApp() {
   const retries = useRef(0);
   const everOpened = useRef(false);
   const wantConnected = useRef(false);
+  const errorTimer = useRef(null);
+  // setBusyAction only lands on the next render, so two taps in the same frame
+  // both pass the disabled check and create two rooms. This ref is the guard;
+  // busyAction stays as the affordance.
+  const inFlight = useRef(false);
+
+  // A command error belongs to the tap that caused it and must not outlive it.
+  // Terminal errors (session gone, room ended) are set without `transient` and
+  // stay until the player acts.
+  const showError = useCallback((message, transient = false) => {
+    clearTimeout(errorTimer.current);
+    setError(message);
+    if (transient && message) errorTimer.current = setTimeout(() => setError(''), 6000);
+  }, []);
+
+  useEffect(() => () => clearTimeout(errorTimer.current), []);
 
   const disconnect = useCallback(() => {
     wantConnected.current = false;
@@ -80,17 +96,17 @@ function LiveApp() {
       clearSession();
       setSession(null);
       setRoom(null);
-      setError('Session expired — join the room again.');
+      showError('Session expired — join the room again.');
       return;
     }
     wantConnected.current = true;
     if (ws.current) { ws.current.onclose = null; ws.current.close(); }
     setStatus('connecting');
     const sock = new WebSocket(wsURL(sess.code, sess.playerId, sess.token));
-    sock.onopen = () => { everOpened.current = true; retries.current = 0; setStatus('connected'); setError(''); };
+    sock.onopen = () => { everOpened.current = true; retries.current = 0; setStatus('connected'); showError(''); };
     sock.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.error) setError(msg.error);
+      if (msg.error) showError(msg.error, true);
       if (msg.room) setRoom(msg.room);
     };
     sock.onclose = () => {
@@ -102,14 +118,14 @@ function LiveApp() {
         clearSession();
         setSession(null);
         setRoom(null);
-        setError(everOpened.current ? 'Disconnected — that room has ended.' : 'Could not find that room.');
+        showError(everOpened.current ? 'Disconnected — that room has ended.' : 'Could not find that room.');
         wantConnected.current = false;
         return;
       }
       setTimeout(() => { if (wantConnected.current) connect(sess); }, Math.min(1500 * retries.current, 5000));
     };
     ws.current = sock;
-  }, []);
+  }, [showError]);
 
   // Reconnect automatically on load / refresh using the stored session.
   useEffect(() => {
@@ -140,7 +156,9 @@ function LiveApp() {
   }
 
   async function createAndJoin(name) {
-    setError('');
+    if (inFlight.current) return;
+    inFlight.current = true;
+    showError('');
     setBusyAction('create');
     try {
       const res = await fetch(`${API}/api/rooms`, { method: 'POST' });
@@ -149,14 +167,17 @@ function LiveApp() {
       if (!data?.code) throw new Error('The server did not return a room code.');
       await joinCreatedRoom(data.code, name);
     } catch (err) {
-      setError(errorMessage(err, 'Could not create a room.'));
+      showError(errorMessage(err, 'Could not create a room.'));
     } finally {
+      inFlight.current = false;
       setBusyAction('');
     }
   }
 
   async function playComputer(name) {
-    setError('');
+    if (inFlight.current) return;
+    inFlight.current = true;
+    showError('');
     setBusyAction('computer');
     try {
       const res = await fetch(`${API}/api/computer-room`, {
@@ -166,31 +187,35 @@ function LiveApp() {
       if (!res.ok) throw new Error(data.error || 'Could not start a computer room.');
       activateRoomSession(data.room?.code, name, data, 'computer');
     } catch (err) {
-      setError(errorMessage(err, 'Could not start a computer room.'));
+      showError(errorMessage(err, 'Could not start a computer room.'));
     } finally {
+      inFlight.current = false;
       setBusyAction('');
     }
   }
 
   async function join(code, name) {
-    setError('');
+    if (inFlight.current) return;
+    showError('');
     const c = normalizeRoomCode(code);
     if (c.length !== 4) {
-      setError('Enter the 4-character room code.');
+      showError('Enter the 4-character room code.');
       return;
     }
+    inFlight.current = true;
     setBusyAction('join');
     try {
       await joinCreatedRoom(c, name);
     } catch (err) {
-      setError(errorMessage(err, 'Could not join that room.'));
+      showError(errorMessage(err, 'Could not join that room.'));
     } finally {
+      inFlight.current = false;
       setBusyAction('');
     }
   }
 
   function leave() {
-    disconnect(); clearSession(); setSession(null); setRoom(null); setError(''); setStatus('idle');
+    disconnect(); clearSession(); setSession(null); setRoom(null); showError(''); setStatus('idle');
   }
 
   if (!session || !room) {
@@ -275,6 +300,17 @@ function useCountdown(deadline) {
 
 function Game({ room, me, status, error, send, onLeave }) {
   const seconds = useCountdown(room.phase_deadline);
+  // A double tap is the default gesture on a phone. The disabled flags below
+  // only flip once the server's snapshot lands, so without this the second tap
+  // sends a duplicate command and the player gets a red error for tapping the
+  // way phones expect. One command per player per round phase is enough.
+  const sentFor = useRef('');
+  const sendOnce = (type, payload = {}) => {
+    const key = `${type}:${room.round_number}:${room.phase}`;
+    if (sentFor.current === key) return;
+    sentFor.current = key;
+    send(type, payload);
+  };
   const meP = room.players.find((p) => p.id === me) || {};
   const isHost = room.host_id === me;
   const isJudge = !!meP.is_judge;
@@ -411,20 +447,21 @@ function Game({ room, me, status, error, send, onLeave }) {
               <div className="prompt-card">
                 <span className="prompt-label">Prompt</span>
                 <p>{room.prompt?.text}</p>
-                <ReportControl card={room.prompt} kind="prompt" roomCode={room.code} />
+                <ReportControl key={room.prompt?.uuid || room.prompt?.id} card={room.prompt} kind="prompt" roomCode={room.code} />
               </div>
               <div className="submissions">
-                {room.submissions?.map((s) => (
+                {(room.submissions || []).map((s) => (
                   <div className={`submission ${s.is_winner ? 'winner' : ''}`} key={s.id}>
                     <span>{room.phase === 'submitting' ? 'Card submitted' : s.answer?.text}</span>
                     {isJudge && room.phase === 'judging' && (
-                      <button className="btn small" onClick={() => send('pick_winner', { submission_id: s.id })}>Pick</button>
+                      <button className="btn small" onClick={() => sendOnce('pick_winner', { submission_id: s.id })}>Pick</button>
                     )}
                     {s.is_winner && s.player_name && <span className="by">{s.player_name} +1</span>}
-                    {room.phase !== 'submitting' && <ReportControl card={s.answer} kind="answer" roomCode={room.code} />}
+                    {room.phase !== 'submitting' && <ReportControl key={s.answer?.uuid || s.answer?.id} card={s.answer} kind="answer" roomCode={room.code} />}
                   </div>
                 ))}
-                {room.phase === 'submitting' && room.submissions?.length === 0 && <p className="muted">No answers in yet...</p>}
+                {room.phase === 'submitting' && (room.submissions || []).length === 0 && <p className="muted">No answers in yet...</p>}
+                {room.phase !== 'submitting' && (room.submissions || []).length === 0 && <p className="muted">Nobody answered in time. On to the next one.</p>}
               </div>
               {room.phase === 'scoring' && isHost && (
                 <button className="btn primary block" onClick={() => send('next_round')}>Next round</button>
@@ -444,7 +481,7 @@ function Game({ room, me, status, error, send, onLeave }) {
             : (meP.hand || []).map((c) => (
                 <button className={`answer-card ${meP.submitted ? 'muted-card' : ''}`} key={c.id}
                         disabled={room.phase !== 'submitting' || isJudge || meP.submitted}
-                        onClick={() => send('submit_answer', { answer_card_id: c.id })}>
+                        onClick={() => sendOnce('submit_answer', { answer_card_id: c.id })}>
                   {c.text}
                 </button>
               ))}
@@ -580,6 +617,16 @@ function connectionLabel(status) {
   return { idle: 'Idle', connecting: 'Connecting', connected: 'Live', closed: 'Reconnecting' }[status] || status;
 }
 
+// The server accepts wider ranges than these presets (score 1-20, timer
+// 15-300s, players 3-20), and computer rooms are created at 45s. A <select>
+// whose value matches no option silently displays the first one, so the host
+// was shown "30s" while the room really ran a 45s timer. Any value off the
+// preset list is added to it instead.
+function withCurrent(options, current) {
+  if (current == null || options.includes(current)) return options;
+  return [...options, current].sort((a, b) => a - b);
+}
+
 function RoomSettings({ room, isHost, send }) {
   const update = (patch) => send('update_settings', { settings: patch });
   const playerCount = room.players.length;
@@ -603,17 +650,17 @@ function RoomSettings({ room, isHost, send }) {
       <div className="settings-grid">
         <label>Win at
           <select value={room.score_limit} onChange={(e) => update({ score_limit: +e.target.value })}>
-            {[3, 5, 7, 10].map((n) => <option key={n} value={n}>{n} points</option>)}
+            {withCurrent([3, 5, 7, 10], room.score_limit).map((n) => <option key={n} value={n}>{n} points</option>)}
           </select>
         </label>
         <label>Answer timer
           <select value={room.round_seconds} onChange={(e) => update({ round_seconds: +e.target.value })}>
-            {[30, 60, 90, 120].map((n) => <option key={n} value={n}>{n}s</option>)}
+            {withCurrent([30, 60, 90, 120], room.round_seconds).map((n) => <option key={n} value={n}>{n}s</option>)}
           </select>
         </label>
         <label>Max players
           <select value={room.max_players} onChange={(e) => update({ max_players: +e.target.value })}>
-            {[4, 6, 8, 12].map((n) => <option key={n} value={n} disabled={n < playerCount}>{n}</option>)}
+            {withCurrent([4, 6, 8, 12], room.max_players).map((n) => <option key={n} value={n} disabled={n < playerCount}>{n}</option>)}
           </select>
         </label>
         <label>Content
@@ -688,6 +735,9 @@ async function dailyRequest(path, { method = 'GET', token, body } = {}) {
 }
 
 function DailyApp() {
+  // Daily groups never expire, so a double-tapped create leaves a permanent
+  // orphan group that the daily worker generates a round for every day.
+  const inFlight = useRef(false);
   const joinCode = normalizeDailyCode(new URLSearchParams(location.search).get('join') || '');
   const initialSessions = loadDailySessions();
   const initialActive = joinCode ? initialSessions.find((item) => item.code === joinCode) : initialSessions[0];
@@ -729,16 +779,20 @@ function DailyApp() {
   }
 
   async function createGroup(input) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy('create'); setError('');
     try {
       const data = await dailyRequest('/api/daily/groups', { method: 'POST', body: input });
       activateSession(data);
       history.replaceState(null, '', '/daily');
     } catch (err) { setError(errorMessage(err, 'Could not create the group.')); }
-    finally { setBusy(''); }
+    finally { inFlight.current = false; setBusy(''); }
   }
 
   async function joinGroup(code, playerName) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy('join'); setError('');
     try {
       const normalized = normalizeDailyCode(code);
@@ -748,7 +802,7 @@ function DailyApp() {
       activateSession(data);
       history.replaceState(null, '', '/daily');
     } catch (err) { setError(errorMessage(err, 'Could not join the group.')); }
-    finally { setBusy(''); }
+    finally { inFlight.current = false; setBusy(''); }
   }
 
   function switchGroup(session) {
@@ -872,7 +926,10 @@ function DailyDashboard({ session, sessions, view, busy, error, onRefresh, onSwi
 function DailyRoundView({ view, session, onChanged, setNotice }) {
   const round = view.today;
   const previous = view.previous;
-  const deadline = round.state === 'OPEN_FOR_SUBMISSIONS' ? round.reveal_at : round.voting_closes_at;
+  // A finalized round has no deadline left to count down to; it kept rendering
+  // "Voting closes in Updating..." forever once the result landed.
+  const deadline = round.state === 'OPEN_FOR_SUBMISSIONS' ? round.reveal_at
+    : round.state === 'REVEALED_FOR_VOTING' ? round.voting_closes_at : null;
   const [answer, setAnswer] = useState(round.my_submission?.answer_text || '');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -916,7 +973,8 @@ function DailyRoundView({ view, session, onChanged, setNotice }) {
       <article className="daily-main card">
         <div className="daily-round-meta">
           <span className={`phase-chip daily-state ${round.state.toLowerCase()}`}>{dailyStateLabel(round.state)}</span>
-          <Deadline deadline={deadline} prefix={round.state === 'OPEN_FOR_SUBMISSIONS' ? 'Reveal' : 'Voting closes'} />
+          {deadline && <Deadline deadline={deadline} prefix={round.state === 'OPEN_FOR_SUBMISSIONS' ? 'Reveal' : 'Voting closes'} />}
+          {!deadline && <span className="daily-deadline">Next prompt at local midnight</span>}
         </div>
         <div className="prompt-card daily-prompt"><span className="prompt-label">Today’s prompt</span><p>{round.prompt}</p></div>
         {round.state === 'OPEN_FOR_SUBMISSIONS' && <div className="daily-compose">
@@ -937,9 +995,9 @@ function DailyRoundView({ view, session, onChanged, setNotice }) {
       <aside className="daily-side">
         <section className="card daily-progress">
           <h3>Group progress</h3>
-          <b>{round.submission_count}/{round.member_count}</b>
+          <b>{round.submission_count || 0}/{round.member_count || 0}</b>
           <span>answers submitted</span>
-          <div className="progress-track"><span style={{ width: `${Math.min(100, (round.submission_count / Math.max(1, round.member_count)) * 100)}%` }} /></div>
+          <div className="progress-track"><span style={{ width: `${Math.min(100, ((round.submission_count || 0) / Math.max(1, round.member_count || 0)) * 100)}%` }} /></div>
         </section>
         {previous && <section className="card previous-round">
           <h3>Previous round</h3>
@@ -954,7 +1012,7 @@ function DailyRoundView({ view, session, onChanged, setNotice }) {
 }
 
 function DailyVoting({ round, busy, onVote }) {
-  if (!round.submissions?.length) return <div className="daily-empty"><h2>No answers today</h2><p>The next prompt opens at local midnight.</p></div>;
+  if (!(round.submissions || []).length) return <div className="daily-empty"><h2>No answers today</h2><p>The next prompt opens at local midnight.</p></div>;
   return <section className="daily-voting"><h2>Vote for the funniest</h2><p className="muted">Authors stay hidden until the result. You can change your vote before close.</p>
     <div className="daily-submissions">{round.submissions.map((submission) => <button key={submission.id}
       className={`daily-submission ${submission.my_vote ? 'selected' : ''}`} disabled={submission.mine || !!busy}
@@ -966,13 +1024,13 @@ function DailyVoting({ round, busy, onVote }) {
 
 function DailyResults({ round, streak, groupName, compact = false, setNotice }) {
   const winners = (round.submissions || []).filter((item) => item.winner);
-  if (!round.submissions?.length) return <p className="muted">No answers were submitted.</p>;
+  if (!(round.submissions || []).length) return <p className="muted">No answers were submitted.</p>;
   return <section className={`daily-results ${compact ? 'compact' : ''}`}>
     {!compact && <><h2>{winners.length ? (winners.length > 1 ? 'It’s a tie' : `${winners[0].author_name} wins`) : 'No votes this round'}</h2>
       <p className="muted">The group has spoken.</p></>}
     <div className="result-list">{round.submissions.map((submission) => <div className={`result-row ${submission.winner ? 'winner' : ''}`} key={submission.id}>
       <span><b>{submission.answer_text}</b><small>{submission.author_name}</small></span>
-      <strong>{submission.vote_count} {submission.vote_count === 1 ? 'vote' : 'votes'}</strong>
+      <strong>{plural(submission.vote_count || 0, 'vote')}</strong>
     </div>)}</div>
     <button className="btn ghost block" onClick={() => downloadDailyShareCard(round, streak, groupName, setNotice)}>Download spoiler-safe share card</button>
   </section>;

@@ -385,6 +385,9 @@ input, textarea { color: var(--text); }
   .daily-prompt { padding: 22px; }
   .daily-round-meta { align-items: flex-start; flex-direction: column; }
   .daily-submission { align-items: flex-start; flex-direction: column; gap: 8px; }
+  /* The byline cannot shrink, so on a narrow screen the winning answer -- the
+     point of the reveal -- was the element that got crushed. */
+  .submission { align-items: flex-start; flex-direction: column; gap: 8px; }
 }
 
 /* --- Reporting ---------------------------------------------------------- */
