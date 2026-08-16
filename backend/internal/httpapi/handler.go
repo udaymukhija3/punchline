@@ -28,6 +28,7 @@ type Handler struct {
 	daily                       *daily.Service
 	content                     *content.Service
 	adminToken                  string
+	deckSource                  string
 	reportLimitPerMin           int
 	adminAuthFailureLimitPerMin int
 	allowedOrigins              map[string]bool
@@ -81,6 +82,14 @@ func (h *Handler) SetCardTelemetry(recorder *telemetry.CardRecorder) {
 	h.metrics.telemetryStats = recorder.Stats
 }
 
+// SetDeckSource records where the running deck came from so a deploy gate can
+// assert it. A silent fallback to the seed file is the failure worth catching:
+// seed cards carry no database row, so telemetry and reporting quietly become
+// no-ops while the game itself looks perfectly healthy.
+func (h *Handler) SetDeckSource(source string) {
+	h.deckSource = source
+}
+
 // SetContentService enables the reporting endpoint and the admin desk. Without
 // it the handler keeps a database-less content service, which fails closed.
 func (h *Handler) SetContentService(service *content.Service) {
@@ -125,6 +134,7 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		"daily_available":   h.daily.Available(),
 		"content_available": h.content.Available(),
 		"admin_enabled":     h.adminToken != "",
+		"deck_source":       h.deckSource,
 	})
 }
 

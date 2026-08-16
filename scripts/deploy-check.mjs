@@ -40,31 +40,16 @@ async function checkAppShell() {
   return { htmlMs: html.ms, assetMs: asset.ms, asset: assetPaths[0] };
 }
 
-function runSmoke() {
+function runSmokeScript(script) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['scripts/smoke-realtime.mjs', baseURL], {
+    const child = spawn(process.execPath, [script, baseURL], {
       cwd: repoRoot,
       stdio: 'inherit',
       env: process.env,
     });
     child.on('exit', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`smoke exited with ${code}`));
-    });
-    child.on('error', reject);
-  });
-}
-
-function runDailySmoke() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['scripts/smoke-daily.mjs', baseURL], {
-      cwd: repoRoot,
-      stdio: 'inherit',
-      env: process.env,
-    });
-    child.on('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`daily smoke exited with ${code}`));
+      else reject(new Error(`${script} exited with ${code}`));
     });
     child.on('error', reject);
   });
@@ -78,6 +63,28 @@ try {
 
   const ready = await get('/readyz');
   console.log(JSON.stringify({ check: 'readyz', ok: true, ms: ready.ms }));
+
+  // A deployment with a database must be serving the database deck. Falling
+  // back to the seed file keeps the game playable, which is exactly why it is
+  // easy to miss: seed cards carry no database row, so card telemetry and the
+  // report button silently stop working. Set PUNCHLINE_EXPECT_DECK_SOURCE=seed
+  // for a deliberately database-less deployment.
+  const health = JSON.parse((await get('/healthz')).text);
+  const expectedDeck = process.env.PUNCHLINE_EXPECT_DECK_SOURCE || 'database';
+  if (!String(health.deck_source || '').startsWith(expectedDeck)) {
+    throw new Error(`deck_source is ${JSON.stringify(health.deck_source)}, expected ${expectedDeck}`);
+  }
+  if (expectedDeck === 'database' && !health.content_available) {
+    throw new Error('content platform is unavailable on a database deployment');
+  }
+  console.log(JSON.stringify({
+    check: 'health',
+    ok: true,
+    deck_source: health.deck_source,
+    daily_available: health.daily_available,
+    content_available: health.content_available,
+    admin_enabled: health.admin_enabled,
+  }));
 
   const metrics = await get('/metrics', metricsToken ? { Authorization: `Bearer ${metricsToken}` } : undefined);
   for (const needle of [
@@ -101,10 +108,14 @@ try {
   }
   console.log(JSON.stringify({ check: 'metrics', ok: true, ms: metrics.ms }));
 
-  await runSmoke();
+  await runSmokeScript('scripts/smoke-realtime.mjs');
   if (!apiOnly || truthy(process.env.PUNCHLINE_CHECK_DAILY)) {
-    await runDailySmoke();
+    await runSmokeScript('scripts/smoke-daily.mjs');
   }
+  // Exercises reporting and the admin queues. The script skips itself when no
+  // admin token is configured, so this is a no-op on a deployment with the desk
+  // turned off.
+  await runSmokeScript('scripts/smoke-content.mjs');
   console.log(JSON.stringify({ check: 'deploy', ok: true, target: baseURL }));
 } catch (err) {
   console.error(JSON.stringify({ check: 'deploy', ok: false, target: baseURL, error: err.message }));

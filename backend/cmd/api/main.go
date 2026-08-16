@@ -70,6 +70,7 @@ func main() {
 	}
 	handler := httpapi.NewHandler(manager, dailyService)
 	handler.SetCardTelemetry(cardTelemetry)
+	handler.SetDeckSource(deckSource)
 	if db != nil {
 		handler.SetContentService(content.NewService(db))
 	}
