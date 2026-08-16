@@ -23,6 +23,17 @@ var (
 	ErrInvalidInput  = errors.New("invalid daily mode input")
 )
 
+// invalidInput carries a message a player can act on while still matching
+// ErrInvalidInput, so the handler keeps mapping it to 400. Six different rules
+// used to collapse into one "invalid daily mode input", which tells someone
+// staring at a rejected form nothing about which field to fix.
+type invalidInput struct{ message string }
+
+func (e invalidInput) Error() string        { return e.message }
+func (e invalidInput) Is(target error) bool { return target == ErrInvalidInput }
+
+func badInput(message string) error { return invalidInput{message: message} }
+
 type CreateGroupInput struct {
 	Name       string `json:"name"`
 	PlayerName string `json:"player_name"`

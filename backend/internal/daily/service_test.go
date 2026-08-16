@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -374,5 +375,38 @@ func TestPostgresTickYieldsWhenAnotherInstanceHoldsTheLock(t *testing.T) {
 	// With the lock free the next tick proceeds normally.
 	if _, err := service.Tick(ctx); err != nil {
 		t.Fatalf("tick after release: %v", err)
+	}
+}
+
+// Six different rules used to collapse into one "invalid daily mode input",
+// which tells someone staring at a rejected form nothing about what to fix.
+func TestValidationErrorsNameTheFieldAndStillMapTo400(t *testing.T) {
+	cases := []struct {
+		label string
+		err   error
+		want  string
+	}{
+		{"empty group name", func() error { _, err := validateName("", 2, 40, "The group name"); return err }(), "The group name needs at least 2 characters"},
+		{"long group name", func() error { _, err := validateName(strings.Repeat("x", 41), 2, 40, "The group name"); return err }(), "The group name has to be 40 characters or fewer"},
+		{"empty player name", func() error { _, err := validateName("", 1, 20, "Your name"); return err }(), "Your name can't be empty"},
+		{"long player name", func() error { _, err := validateName(strings.Repeat("x", 21), 1, 20, "Your name"); return err }(), "Your name has to be 20 characters or fewer"},
+		{"control characters", func() error { _, err := validateName("Bo\x00b", 1, 20, "Your name"); return err }(), "Your name can only use ordinary characters"},
+	}
+	for _, tc := range cases {
+		if tc.err == nil {
+			t.Fatalf("%s: expected an error", tc.label)
+		}
+		if tc.err.Error() != tc.want {
+			t.Fatalf("%s: message = %q, want %q", tc.label, tc.err.Error(), tc.want)
+		}
+		// Still a 400, not a 503: the handler routes on ErrInvalidInput.
+		if !errors.Is(tc.err, ErrInvalidInput) {
+			t.Fatalf("%s: no longer matches ErrInvalidInput", tc.label)
+		}
+	}
+	// A valid name still comes back normalised, not rejected.
+	got, err := validateName("  Friday   People  ", 2, 40, "The group name")
+	if err != nil || got != "Friday People" {
+		t.Fatalf("valid name = (%q, %v)", got, err)
 	}
 }

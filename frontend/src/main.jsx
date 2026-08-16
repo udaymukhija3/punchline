@@ -45,9 +45,22 @@ async function readPayload(res) {
   }
 }
 
+// The server's strings are written for logs, not for someone standing in a
+// kitchen holding a phone. Anything not listed here is already player-facing.
+const PLAYER_COPY = {
+  'room not found': 'No room with that code. Check the four characters and try again.',
+  'room is full': 'That room is full.',
+  'could not join room': 'Could not join that room. Try again in a moment.',
+  'could not save room': 'Could not save the room. Try again in a moment.',
+  'could not create room': 'Could not create a room. Try again in a moment.',
+  'too many requests': 'That was a lot of taps. Give it a minute.',
+  'too many messages': 'That was a lot of taps. Give it a minute.',
+};
+
 function errorMessage(err, fallback) {
   if (err instanceof TypeError) return 'Could not reach the server. Check your connection and try again.';
-  return err?.message || fallback;
+  const raw = err?.message || '';
+  return PLAYER_COPY[raw.toLowerCase()] || raw || fallback;
 }
 
 function plural(n, word) {
@@ -59,8 +72,19 @@ function App() {
   return location.pathname.startsWith('/daily') ? <DailyApp /> : <LiveApp />;
 }
 
+// A link to a room you are not in beats the room you are in: clicking a
+// friend's invite used to drop you back into your old room with no sign the
+// link had been read at all.
+function invitedRoomCode() {
+  return normalizeRoomCode(new URLSearchParams(location.search).get('join') || '');
+}
+
 function LiveApp() {
-  const [session, setSession] = useState(loadSession);
+  const [session, setSession] = useState(() => {
+    const stored = loadSession();
+    const invited = invitedRoomCode();
+    return invited && stored?.code !== invited ? null : stored;
+  });
   const [room, setRoom] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | connecting | connected | closed
   const [error, setError] = useState('');
@@ -106,7 +130,7 @@ function LiveApp() {
     sock.onopen = () => { everOpened.current = true; retries.current = 0; setStatus('connected'); showError(''); };
     sock.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.error) showError(msg.error, true);
+      if (msg.error) showError(PLAYER_COPY[msg.error.toLowerCase()] || msg.error, true);
       if (msg.room) setRoom(msg.room);
     };
     sock.onclose = () => {
@@ -825,6 +849,16 @@ function DailyLanding({ sessions, joinCode, busy, error, onCreate, onJoin, onOpe
   const [playerName, setPlayerName] = useState(localStorage.getItem('punchline.name') || '');
   const [groupName, setGroupName] = useState('');
   const [code, setCode] = useState(joinCode);
+  // Group codes never contain O, 0, 1, I or L, so those characters are dropped
+  // as you type. Silently eating them leaves a code that looks complete beside
+  // a Join button that refuses to light up, with nothing explaining why.
+  const [codeNotice, setCodeNotice] = useState('');
+  const typeCode = (value) => {
+    const cleaned = normalizeDailyCode(value);
+    const dropped = [...value.toUpperCase()].some((c) => /[A-Z0-9]/.test(c) && !DAILY_ALPHABET.includes(c));
+    setCodeNotice(dropped ? 'Codes skip O, 0, 1, I and L to keep them easy to read aloud.' : '');
+    setCode(cleaned);
+  };
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   const rememberName = (value) => { setPlayerName(value); localStorage.setItem('punchline.name', value); };
   const cleanPlayer = playerName.trim();
@@ -861,11 +895,12 @@ function DailyLanding({ sessions, joinCode, busy, error, onCreate, onJoin, onOpe
             <div className="divider"><span>or join with a code</span></div>
             <div className="join-box daily-join-box">
               <input className="field code-input" aria-label="Daily group code" maxLength={6} value={code}
-                onChange={(event) => setCode(normalizeDailyCode(event.target.value))} placeholder="6-letter code" />
+                onChange={(event) => typeCode(event.target.value)} placeholder="6-letter code" />
               <button className="btn" disabled={!cleanPlayer || code.length !== 6 || !!busy} onClick={() => onJoin(code, cleanPlayer)}>
                 {busy === 'join' ? 'Joining…' : 'Join'}
               </button>
             </div>
+            {codeNotice && <p className="muted small" aria-live="polite">{codeNotice}</p>}
           </>}
           {error && <p className="err" role="alert">{error}</p>}
         </div>

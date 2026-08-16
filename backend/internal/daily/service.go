@@ -183,9 +183,12 @@ func (s *Service) JoinGroup(ctx context.Context, code string, input JoinGroupInp
 		return Session{}, ErrUnavailable
 	}
 	code = normalizeCode(code)
-	name, err := validateName(input.PlayerName, 1, 20)
-	if err != nil || len(code) != 6 {
-		return Session{}, ErrInvalidInput
+	if len(code) != 6 {
+		return Session{}, badInput("That group code doesn't look right — they're six characters")
+	}
+	name, err := validateName(input.PlayerName, 1, 20, "Your name")
+	if err != nil {
+		return Session{}, err
 	}
 	membershipID, err := randomUUID()
 	if err != nil {
@@ -298,9 +301,9 @@ func (s *Service) UpdateGroup(ctx context.Context, code, token string, input Upd
 	}
 	name := group.Name
 	if input.Name != nil {
-		validated, err := validateName(*input.Name, 2, 40)
+		validated, err := validateName(*input.Name, 2, 40, "The group name")
 		if err != nil {
-			return Group{}, ErrInvalidInput
+			return Group{}, err
 		}
 		name = validated
 	}
@@ -400,8 +403,15 @@ func (s *Service) Submit(ctx context.Context, roundID, token, answer string) err
 		return ErrUnavailable
 	}
 	answer = strings.TrimSpace(answer)
-	if !validUUID(roundID) || answer == "" || utf8.RuneCountInString(answer) > 160 || hasUnsafeControl(answer) {
-		return ErrInvalidInput
+	switch {
+	case !validUUID(roundID):
+		return badInput("That round link is no longer valid — reload the page")
+	case answer == "":
+		return badInput("Write something before locking it in")
+	case utf8.RuneCountInString(answer) > 160:
+		return badInput("Punchlines have to be 160 characters or fewer")
+	case hasUnsafeControl(answer):
+		return badInput("Your punchline can only use ordinary characters")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -438,7 +448,7 @@ func (s *Service) Vote(ctx context.Context, roundID, token, submissionID string)
 		return ErrUnavailable
 	}
 	if !validUUID(roundID) || !validUUID(submissionID) {
-		return ErrInvalidInput
+		return badInput("That vote didn't land — reload the page and try again")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -842,13 +852,13 @@ func (s *Service) promptFor(groupID, date string) cards.PromptCard {
 }
 
 func validateCreateInput(input CreateGroupInput) (string, string, *time.Location, error) {
-	groupName, err := validateName(input.Name, 2, 40)
+	groupName, err := validateName(input.Name, 2, 40, "The group name")
 	if err != nil {
-		return "", "", nil, ErrInvalidInput
+		return "", "", nil, err
 	}
-	playerName, err := validateName(input.PlayerName, 1, 20)
+	playerName, err := validateName(input.PlayerName, 1, 20, "Your name")
 	if err != nil {
-		return "", "", nil, ErrInvalidInput
+		return "", "", nil, err
 	}
 	timezone := strings.TrimSpace(input.Timezone)
 	if timezone == "" {
@@ -856,16 +866,25 @@ func validateCreateInput(input CreateGroupInput) (string, string, *time.Location
 	}
 	location, err := time.LoadLocation(timezone)
 	if err != nil {
-		return "", "", nil, ErrInvalidInput
+		return "", "", nil, badInput("We couldn't read your timezone — check your device's clock settings")
 	}
 	return groupName, playerName, location, nil
 }
 
-func validateName(value string, min, max int) (string, error) {
+func validateName(value string, min, max int, label string) (string, error) {
 	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if hasUnsafeControl(value) {
+		return "", badInput(label + " can only use ordinary characters")
+	}
 	count := utf8.RuneCountInString(value)
-	if count < min || count > max || hasUnsafeControl(value) {
-		return "", ErrInvalidInput
+	if count < min {
+		if min == 1 {
+			return "", badInput(label + " can't be empty")
+		}
+		return "", badInput(fmt.Sprintf("%s needs at least %d characters", label, min))
+	}
+	if count > max {
+		return "", badInput(fmt.Sprintf("%s has to be %d characters or fewer", label, max))
 	}
 	return value, nil
 }
