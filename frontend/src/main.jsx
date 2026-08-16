@@ -215,6 +215,9 @@ function LiveApp() {
   }
 
   function leave() {
+    // Tell the room first: without this the seat stays occupied for the life of
+    // the room and nobody can free it.
+    send('leave');
     disconnect(); clearSession(); setSession(null); setRoom(null); showError(''); setStatus('idle');
   }
 

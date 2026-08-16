@@ -267,10 +267,6 @@ func (h *Handler) roomByCode(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, "room is full")
 				return
 			}
-			if errors.Is(err, realtime.ErrRoomAlreadyStarted) {
-				writeError(w, http.StatusConflict, "game already started")
-				return
-			}
 			if errors.Is(err, realtime.ErrInvalidName) {
 				writeError(w, http.StatusBadRequest, "that name has characters we can't use — try letters and numbers")
 				return
@@ -369,8 +365,20 @@ func (h *Handler) wsRoom(w http.ResponseWriter, r *http.Request) {
 			actionErr = room.SkipPrompt(playerID)
 		case "start_computer_game":
 			actionErr = room.StartComputerGame(playerID)
+		case "leave":
+			actionErr = room.Leave(playerID)
 		default:
 			actionErr = errUnknownMessage
+		}
+		// A player who leaves is out of the roster, so there is nothing left to
+		// send them: save, tell the room, and close the socket.
+		if msg.Type == "leave" && actionErr == nil {
+			if err := h.manager.PersistRoom(r.Context(), room); err != nil {
+				log.Printf("persist room action leave: %v", err)
+			}
+			h.metrics.recordWSMessage(msg.Type, "ok")
+			room.Broadcast()
+			return
 		}
 		if actionErr != nil {
 			h.metrics.recordActionError(msg.Type)

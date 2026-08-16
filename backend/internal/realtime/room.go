@@ -40,9 +40,8 @@ const (
 )
 
 var (
-	ErrRoomFull           = errors.New("room is full")
-	ErrRoomAlreadyStarted = errors.New("game already started")
-	ErrInvalidName        = errors.New("name contains unsupported characters")
+	ErrRoomFull    = errors.New("room is full")
+	ErrInvalidName = errors.New("name contains unsupported characters")
 
 	errNotHost      = errors.New("only the host can do that")
 	errNotFound     = errors.New("player not found")
@@ -303,12 +302,18 @@ func (r *Room) TryJoin(name string) (Player, error) {
 	if !ValidPlayerName(name) {
 		return Player{}, ErrInvalidName
 	}
-	if r.phase != PhaseLobby {
-		return Player{}, ErrRoomAlreadyStarted
-	}
 	if len(r.order) >= r.maxPlayers {
 		return Player{}, ErrRoomFull
 	}
+	// A friend who arrives ten minutes late used to be told "game already
+	// started" and locked out until the host ended the game, which is the most
+	// common thing that happens at a real party. They come in with a fresh hand
+	// and no score, and the judge rotation picks them up on its next pass. If
+	// the room is mid-answer they can still play this round; otherwise they
+	// watch the reveal and start with everyone else next round.
+	// The submit timer keeps its existing deadline; a late arrival lengthens
+	// what allAnswerersSubmitted expects, so the round waits for them but the
+	// clock does not restart on the players already waiting.
 	return r.joinLocked(name), nil
 }
 
@@ -341,6 +346,122 @@ func (r *Room) UndoJoin(playerID string) {
 		r.reassignHostLocked()
 	}
 	r.touch()
+}
+
+// Leave removes a player for good. Until now "Leave" only dropped the socket,
+// so the seat stayed occupied for the life of the room: a party that churns
+// through phones and reloads slowly fills every seat with people who are not
+// there, and there is no way to get them out.
+func (r *Room) Leave(playerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p := r.players[playerID]
+	if p == nil {
+		return errNotFound
+	}
+	wasJudge := p.IsJudge && (r.phase == PhaseSubmitting || r.phase == PhaseJudging)
+	r.removePlayerLocked(playerID)
+	r.applyRosterLossLocked(wasJudge)
+	r.touch()
+	return nil
+}
+
+// removePlayerLocked takes a player out of the roster and puts everything they
+// were holding back in circulation. It does not decide what that means for the
+// round; applyRosterLossLocked does.
+func (r *Room) removePlayerLocked(playerID string) {
+	p := r.players[playerID]
+	if p == nil {
+		return
+	}
+	r.answerPile = append(r.answerPile, p.Hand...)
+	for id, sub := range r.submissions {
+		if sub.PlayerID == playerID {
+			r.answerPile = append(r.answerPile, sub.Answer)
+			delete(r.submissions, id)
+		}
+	}
+	index := -1
+	for i, id := range r.order {
+		if id == playerID {
+			index = i
+			break
+		}
+	}
+	if index >= 0 {
+		r.order = append(r.order[:index], r.order[index+1:]...)
+		// judgeIndex is a position in order, so removing anyone at or before
+		// the judge shifts it. Stepping back by one keeps the next rotation on
+		// the player who slid into the vacated slot instead of skipping them.
+		if index <= r.judgeIndex {
+			r.judgeIndex--
+		}
+	}
+	delete(r.players, playerID)
+	delete(r.clients, playerID)
+	if len(r.order) > 0 {
+		r.judgeIndex = ((r.judgeIndex % len(r.order)) + len(r.order)) % len(r.order)
+	} else {
+		r.judgeIndex = 0
+	}
+	if r.hostID == playerID {
+		r.reassignHostLocked()
+		// reassignHostLocked only considers players with a live socket, which is
+		// the right call for a flaky disconnect. Leaving is deliberate, so the
+		// room should never be left hostless over someone's momentary drop:
+		// fall back to whoever is next in the roster.
+		if r.hostID == "" {
+			for _, id := range r.order {
+				if p := r.players[id]; p != nil && !p.IsComputer {
+					r.hostID = id
+					break
+				}
+			}
+		}
+	}
+}
+
+// applyRosterLossLocked resolves the round after someone leaves mid-game.
+func (r *Room) applyRosterLossLocked(wasJudge bool) {
+	if r.phase == PhaseLobby || r.phase == PhaseFinished {
+		return
+	}
+	// Below the floor there is no game left to play. Ending it puts the room on
+	// the game-over screen, where the host can invite people and play again.
+	if len(r.order) < minPlayersToStart {
+		r.setPhaseLocked(PhaseFinished, 0)
+		return
+	}
+	if wasJudge {
+		// Nobody can award this round, so it is void. Played cards go back to
+		// their owners rather than being burned for a round that never scored.
+		for _, sub := range r.submissions {
+			if p := r.players[sub.PlayerID]; p != nil {
+				p.Hand = append(p.Hand, sub.Answer)
+			}
+		}
+		r.submissions = map[string]Submission{}
+		for _, id := range r.order {
+			r.players[id].IsJudge = false
+		}
+		r.judgeID = ""
+		r.setPhaseLocked(PhaseScoring, 0)
+		return
+	}
+	switch r.phase {
+	case PhaseSubmitting:
+		// The room may have been waiting only on the player who just left.
+		if r.allAnswerersSubmitted() {
+			r.beginJudgingLocked()
+			r.scheduleComputerTurnsLocked()
+		}
+	case PhaseJudging:
+		// Their card may have been the only thing left to judge.
+		if len(r.submissions) == 0 {
+			r.setPhaseLocked(PhaseScoring, 0)
+		}
+	}
 }
 
 func (r *Room) joinLocked(name string) Player {

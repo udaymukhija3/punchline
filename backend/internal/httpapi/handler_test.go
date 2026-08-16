@@ -244,7 +244,7 @@ func TestJoinRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestJoinAfterGameStartsIsRejected(t *testing.T) {
+func TestJoinAfterGameStartsIsAllowed(t *testing.T) {
 	manager := realtime.NewRoomManager(cards.NewSeedDeck())
 	room, err := manager.CreateRoom(context.Background())
 	if err != nil {
@@ -271,8 +271,13 @@ func TestJoinAfterGameStartsIsRejected(t *testing.T) {
 
 	handler.Routes().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	// Someone clicking the invite link after the host started is the normal
+	// case at a party, not an error.
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if got := len(room.SnapshotFor("").Players); got != 4 {
+		t.Fatalf("roster = %d, want the latecomer seated", got)
 	}
 }
 
