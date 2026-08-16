@@ -1300,6 +1300,17 @@ func newSecret(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b)
 }
 
+// VerifyPlayer reports whether a player id and guest token belong to this room.
+// The card report endpoint uses it to identify a reporter as a person rather
+// than as an address.
+func (r *Room) VerifyPlayer(playerID, guestToken string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p := r.players[playerID]
+	return p != nil && !p.IsComputer && validGuestToken(p.GuestToken, guestToken)
+}
+
 func validGuestToken(expected string, got string) bool {
 	if expected == "" || got == "" {
 		return false

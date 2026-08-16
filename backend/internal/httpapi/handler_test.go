@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"punchline/backend/internal/cards"
+	"punchline/backend/internal/content"
 	"punchline/backend/internal/realtime"
 )
 
@@ -565,5 +566,61 @@ func TestJoinWithControlCharactersIsRejectedAndLeavesTheRoomHealthy(t *testing.T
 		if strings.ContainsRune(p.Name, 0) {
 			t.Fatalf("roster kept an unpersistable name: %q", p.Name)
 		}
+	}
+}
+
+// Reports used to be deduped by client address, which counted networks rather
+// than people. Everyone at a party is behind one WiFi, so a whole table
+// agreeing a card is vile counted as a single reporter and could never reach
+// the auto-retire threshold; meanwhile one person with WiFi, cell data and a
+// VPN counted three times.
+func TestReporterSeedIdentifiesPlayersNotAddresses(t *testing.T) {
+	manager := realtime.NewRoomManager(cards.NewSeedDeck())
+	handler := NewHandler(manager)
+	room, err := manager.CreateRoom(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := room.SnapshotFor("").Code
+	alice, err := room.TryJoin("Alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := room.TryJoin("Bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := func(body content.ReportInput) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/cards/report", nil)
+		r.RemoteAddr = "203.0.113.7:5000" // one household, one address
+		return r
+	}
+	seed := func(input content.ReportInput) string { return handler.reporterSeed(req(input), input) }
+
+	aliceSeed := seed(content.ReportInput{RoomCode: code, PlayerID: alice.ID, Token: alice.GuestToken})
+	bobSeed := seed(content.ReportInput{RoomCode: code, PlayerID: bob.ID, Token: bob.GuestToken})
+	if aliceSeed == bobSeed {
+		t.Fatal("two players on one address still count as one reporter")
+	}
+	if aliceSeed != seed(content.ReportInput{RoomCode: code, PlayerID: alice.ID, Token: alice.GuestToken}) {
+		t.Fatal("the same player reporting twice must stay one reporter")
+	}
+
+	// Anything that cannot prove a seat falls back to the address, so an
+	// unverified client cannot mint identities.
+	fallback := seed(content.ReportInput{})
+	for _, bogus := range []content.ReportInput{
+		{RoomCode: code, PlayerID: alice.ID, Token: "wrong-token"},
+		{RoomCode: code, PlayerID: "pl_nobody", Token: alice.GuestToken},
+		{RoomCode: "ZZZZ", PlayerID: alice.ID, Token: alice.GuestToken},
+		{RoomCode: code, PlayerID: alice.ID},
+	} {
+		if got := seed(bogus); got != fallback {
+			t.Fatalf("unverified report seeded %q, want the address fallback", got)
+		}
+	}
+	if fallback == aliceSeed {
+		t.Fatal("the address fallback collided with a verified player")
 	}
 }

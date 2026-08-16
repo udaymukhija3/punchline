@@ -224,7 +224,7 @@ function LiveApp() {
   if (!session || !room) {
     return <Landing onCreate={createAndJoin} onJoin={join} onComputer={playComputer} error={error} reconnecting={!!session} busyAction={busyAction} />;
   }
-  return <Game room={room} me={session.playerId} status={status} error={error} send={send} onLeave={leave} />;
+  return <Game room={room} me={session.playerId} session={session} status={status} error={error} send={send} onLeave={leave} />;
 }
 
 function Landing({ onCreate, onJoin, onComputer, error, reconnecting, busyAction }) {
@@ -301,7 +301,7 @@ function useCountdown(deadline) {
   return Math.max(0, Math.round((new Date(deadline).getTime() - Date.now()) / 1000));
 }
 
-function Game({ room, me, status, error, send, onLeave }) {
+function Game({ room, me, session, status, error, send, onLeave }) {
   const seconds = useCountdown(room.phase_deadline);
   // A double tap is the default gesture on a phone. The disabled flags below
   // only flip once the server's snapshot lands, so without this the second tap
@@ -450,7 +450,7 @@ function Game({ room, me, status, error, send, onLeave }) {
               <div className="prompt-card">
                 <span className="prompt-label">Prompt</span>
                 <p>{room.prompt?.text}</p>
-                <ReportControl key={room.prompt?.uuid || room.prompt?.id} card={room.prompt} kind="prompt" roomCode={room.code} />
+                <ReportControl key={room.prompt?.uuid || room.prompt?.id} card={room.prompt} kind="prompt" roomCode={room.code} session={session} />
               </div>
               <div className="submissions">
                 {(room.submissions || []).map((s) => (
@@ -460,7 +460,7 @@ function Game({ room, me, status, error, send, onLeave }) {
                       <button className="btn small" onClick={() => sendOnce('pick_winner', { submission_id: s.id })}>Pick</button>
                     )}
                     {s.is_winner && s.player_name && <span className="by">{s.player_name} +1</span>}
-                    {room.phase !== 'submitting' && <ReportControl key={s.answer?.uuid || s.answer?.id} card={s.answer} kind="answer" roomCode={room.code} />}
+                    {room.phase !== 'submitting' && <ReportControl key={s.answer?.uuid || s.answer?.id} card={s.answer} kind="answer" roomCode={room.code} session={session} />}
                   </div>
                 ))}
                 {room.phase === 'submitting' && (room.submissions || []).length === 0 && <p className="muted">No answers in yet...</p>}
@@ -1101,7 +1101,7 @@ const REPORT_REASONS = [
 
 // Cards only carry a uuid when they came from the database, so the control
 // hides itself for seed-backed decks rather than offering a dead button.
-function ReportControl({ card, kind, roomCode }) {
+function ReportControl({ card, kind, roomCode, session }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState('');
   if (!card?.uuid) return null;
@@ -1112,7 +1112,14 @@ function ReportControl({ card, kind, roomCode }) {
       const res = await fetch('/api/cards/report', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ card_kind: kind, card_id: card.uuid, reason, detail: '', room_code: roomCode || '' }),
+        body: JSON.stringify({
+          card_kind: kind, card_id: card.uuid, reason, detail: '',
+          room_code: roomCode || '',
+          // Identifies the reporter as a person in this room rather than as an
+          // address, so a table full of friends on one WiFi counts as a table
+          // full of reporters.
+          player_id: session?.playerId || '', token: session?.token || '',
+        }),
       });
       if (!res.ok) throw new Error('report failed');
       setState('done');

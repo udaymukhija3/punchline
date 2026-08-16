@@ -29,6 +29,11 @@ type ReportInput struct {
 	Reason   string `json:"reason"`
 	Detail   string `json:"detail"`
 	RoomCode string `json:"room_code"`
+	// PlayerID and Token identify the reporter as a person in a room. They are
+	// verified against the room before they are trusted, and only ever reach
+	// the database as part of a hash.
+	PlayerID string `json:"player_id"`
+	Token    string `json:"token"`
 }
 
 // ReportResult tells the client what happened without leaking moderation
