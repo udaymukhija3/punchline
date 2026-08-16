@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"punchline/backend/internal/cards"
 	"punchline/backend/internal/telemetry"
@@ -41,6 +42,7 @@ const (
 var (
 	ErrRoomFull           = errors.New("room is full")
 	ErrRoomAlreadyStarted = errors.New("game already started")
+	ErrInvalidName        = errors.New("name contains unsupported characters")
 
 	errNotHost      = errors.New("only the host can do that")
 	errNotFound     = errors.New("player not found")
@@ -298,6 +300,9 @@ func (r *Room) TryJoin(name string) (Player, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if !ValidPlayerName(name) {
+		return Player{}, ErrInvalidName
+	}
 	if r.phase != PhaseLobby {
 		return Player{}, ErrRoomAlreadyStarted
 	}
@@ -307,12 +312,43 @@ func (r *Room) TryJoin(name string) (Player, error) {
 	return r.joinLocked(name), nil
 }
 
+// UndoJoin rolls a player back out of the roster when the join failed after the
+// mutation but before the client learned its id and guest token. That player can
+// never connect — the only copy of its token died with the failed request — so
+// leaving the entry behind would hold a seat against the room's capacity for as
+// long as the room lives.
+func (r *Room) UndoJoin(playerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p := r.players[playerID]
+	// A connected player, or a room that has already left the lobby, is past the
+	// point where quietly removing a seat is safe: the judge rotation and the
+	// submission set are indexed by the roster.
+	if p == nil || p.Connected || r.phase != PhaseLobby {
+		return
+	}
+	// Hand the dealt cards back so the next joiner still draws distinct answers.
+	r.answerPile = append(r.answerPile, p.Hand...)
+	delete(r.players, playerID)
+	for i, id := range r.order {
+		if id == playerID {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
+	if r.hostID == playerID {
+		r.reassignHostLocked()
+	}
+	r.touch()
+}
+
 func (r *Room) joinLocked(name string) Player {
 	return r.addPlayerLocked(name, false)
 }
 
 func (r *Room) addPlayerLocked(name string, isComputer bool) Player {
-	cleanName := clampName(strings.TrimSpace(name))
+	cleanName := clampName(strings.TrimSpace(stripControlChars(name)))
 	if cleanName == "" {
 		cleanName = "Guest"
 	}
@@ -1085,6 +1121,39 @@ func validPhase(phase Phase) bool {
 	default:
 		return false
 	}
+}
+
+// ValidPlayerName rejects names the room cannot carry. Control characters are
+// the ones that matter: a name is a single line of display text, and a NUL byte
+// in particular cannot survive the JSONB round trip to Postgres, so accepting
+// one poisons the room's snapshot for good. Daily mode already draws this line
+// (see daily.hasUnsafeControl); the live game now draws it in the same place.
+func ValidPlayerName(name string) bool {
+	return !hasControlChars(name)
+}
+
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripControlChars is the belt to ValidPlayerName's braces. Every production
+// join is validated first, but computer seats and tests reach the roster by
+// other paths, and no path may put an unpersistable rune into room state.
+func stripControlChars(s string) string {
+	if !hasControlChars(s) {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func clampName(s string) string {
