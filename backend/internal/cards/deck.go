@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -67,6 +69,27 @@ func (d Deck) For(tier string) Deck {
 		}
 	}
 	return out
+}
+
+// Fingerprint identifies the deck by its contents. A reloaded deck is compared
+// against the running one so a refresh that found nothing new stays silent and
+// leaves rooms alone, while a retire or a promotion is visible as a change.
+// Order matters, but both loaders sort deterministically.
+func (d Deck) Fingerprint() uint64 {
+	h := fnv.New64a()
+	for _, p := range d.Prompts {
+		_, _ = io.WriteString(h, "p\x00"+p.ID+"\x00"+p.Text+"\x00"+p.Tier+"\x00")
+	}
+	for _, a := range d.Answers {
+		_, _ = io.WriteString(h, "a\x00"+a.ID+"\x00"+a.Text+"\x00"+a.Tier+"\x00")
+	}
+	return h.Sum64()
+}
+
+// Playable reports whether the deck has anything to deal. Rooms draw prompts
+// and answers separately, so an empty pile on either side is unplayable.
+func (d Deck) Playable() bool {
+	return len(d.Prompts) > 0 && len(d.Answers) > 0
 }
 
 // ShuffledPrompts returns a fresh shuffled copy of the prompt pile.

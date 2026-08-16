@@ -75,6 +75,7 @@ func main() {
 		handler.SetContentService(content.NewService(db))
 	}
 	handler.StartDailyWorker(ctx, getenvDuration("DAILY_WORKER_INTERVAL", time.Minute))
+	startDeckRefresh(ctx, db, manager, dailyService, getenvDuration("DECK_REFRESH_INTERVAL", 5*time.Minute))
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -149,6 +150,49 @@ func resolveDeck(ctx context.Context, db *sql.DB) (cards.Deck, string) {
 		log.Fatalf("load seed deck %s: %v", deckPath, err)
 	}
 	return deck, "seed " + deckPath
+}
+
+// startDeckRefresh keeps the dealt deck in step with moderation. Without it the
+// deck is a snapshot taken at boot, so a card auto-retired at three reporters —
+// or retired by hand at the admin desk — keeps being dealt until the next
+// deploy, and a promoted community card never gets dealt at all. Only rooms
+// created after a refresh see the change; a round in progress keeps its piles.
+//
+// A seed-backed deck has nothing to refresh from, so this is a no-op without a
+// database.
+func startDeckRefresh(ctx context.Context, db *sql.DB, manager *realtime.RoomManager, dailyService *daily.Service, interval time.Duration) {
+	if db == nil || interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			deck, err := cards.LoadDeckFromDB(loadCtx, db)
+			cancel()
+			if err != nil {
+				log.Printf("deck refresh: %v", err)
+				continue
+			}
+			// An empty result is far more likely to be a bad query or a
+			// half-run migration than a genuinely empty pack, and swapping it
+			// in would leave every new room undealable.
+			if !deck.Playable() {
+				log.Printf("deck refresh: ignoring unplayable deck prompts=%d answers=%d", len(deck.Prompts), len(deck.Answers))
+				continue
+			}
+			if manager.SetDeck(deck) {
+				log.Printf("deck refreshed prompts=%d answers=%d", len(deck.Prompts), len(deck.Answers))
+			}
+			dailyService.SetDeck(deck)
+		}
+	}()
 }
 
 func getenv(key, fallback string) string {
