@@ -77,6 +77,12 @@ func main() {
 	handler.StartDailyWorker(ctx, getenvDuration("DAILY_WORKER_INTERVAL", time.Minute))
 	startDeckRefresh(ctx, db, manager, dailyService, getenvDuration("DECK_REFRESH_INTERVAL", 5*time.Minute))
 
+	// /metrics is public unless a token is set. That is fine for a laptop, and
+	// a quiet mistake for a deployment with a real database behind it.
+	if db != nil && strings.TrimSpace(os.Getenv("PUNCHLINE_METRICS_TOKEN")) == "" {
+		log.Println("warning: /metrics is served without authentication; set PUNCHLINE_METRICS_TOKEN")
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           handler.Routes(),
