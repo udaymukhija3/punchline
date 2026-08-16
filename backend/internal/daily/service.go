@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata"
 	"unicode"
@@ -31,10 +32,48 @@ const (
 )
 
 type Service struct {
-	db        *sql.DB
+	db *sql.DB
+	// promptsMu guards prompts alone: the deck is refreshed in the background
+	// while rounds are being created.
+	promptsMu sync.RWMutex
 	prompts   []cards.PromptCard
 	now       func() time.Time
 	telemetry telemetry.Recorder
+}
+
+// SetDeck refreshes the prompt pool daily rounds draw from, so a retired or
+// promoted card reaches tomorrow's prompt without a redeploy. Today's rounds
+// are already written and keep the prompt they were created with.
+func (s *Service) SetDeck(deck cards.Deck) bool {
+	if s == nil {
+		return false
+	}
+	prompts := deck.For(cards.TierFamily).Prompts
+	if len(prompts) == 0 {
+		return false
+	}
+	s.promptsMu.Lock()
+	defer s.promptsMu.Unlock()
+	if len(prompts) == len(s.prompts) {
+		same := true
+		for i := range prompts {
+			if prompts[i].ID != s.prompts[i].ID || prompts[i].Text != s.prompts[i].Text {
+				same = false
+				break
+			}
+		}
+		if same {
+			return false
+		}
+	}
+	s.prompts = prompts
+	return true
+}
+
+func (s *Service) promptPool() []cards.PromptCard {
+	s.promptsMu.RLock()
+	defer s.promptsMu.RUnlock()
+	return s.prompts
 }
 
 // SetCardTelemetry attaches a card telemetry recorder. A daily round "plays"
@@ -54,7 +93,7 @@ func UnavailableService() *Service {
 	return &Service{now: time.Now}
 }
 
-func (s *Service) Available() bool { return s != nil && s.db != nil && len(s.prompts) > 0 }
+func (s *Service) Available() bool { return s != nil && s.db != nil && len(s.promptPool()) > 0 }
 
 func (s *Service) Ready(ctx context.Context) error {
 	if !s.Available() {
@@ -796,9 +835,10 @@ func (s *Service) groupStreak(ctx context.Context, groupID string, now time.Time
 }
 
 func (s *Service) promptFor(groupID, date string) cards.PromptCard {
+	prompts := s.promptPool()
 	digest := sha256.Sum256([]byte(groupID + ":" + date))
-	index := binary.BigEndian.Uint64(digest[:8]) % uint64(len(s.prompts))
-	return s.prompts[index]
+	index := binary.BigEndian.Uint64(digest[:8]) % uint64(len(prompts))
+	return prompts[index]
 }
 
 func validateCreateInput(input CreateGroupInput) (string, string, *time.Location, error) {
