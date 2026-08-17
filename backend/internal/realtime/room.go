@@ -84,9 +84,9 @@ type Room struct {
 	// revealOrder fixes the order cards turn over in, shuffled once per round.
 	// It also drives snapshot ordering, so a card's position on the table never
 	// betrays how fast its author answered. revealIndex is how many are face up.
-	revealOrder []string
-	revealIndex int
-	answerPile  []cards.AnswerCard
+	revealOrder   []string
+	revealIndex   int
+	answerPile    []cards.AnswerCard
 	promptPile    []cards.PromptCard
 	clients       map[string]map[*ws.Conn]bool
 	createdAt     time.Time

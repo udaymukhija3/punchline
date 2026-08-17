@@ -58,8 +58,8 @@ type RoomSnapshot struct {
 	RevealIndex int          `json:"reveal_index,omitempty"`
 	Players     []Player     `json:"players"`
 	Submissions []Submission `json:"submissions,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
 }
 
 // Settings are the host-configurable room options. A zero numeric field means

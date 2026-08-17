@@ -26,33 +26,33 @@ type RoomStateStore interface {
 }
 
 type PersistedRoomState struct {
-	SchemaVersion int                `json:"schema_version"`
-	Revision      uint64             `json:"revision"`
-	InstanceID    string             `json:"-"`
-	Code          string             `json:"code"`
-	Phase         Phase              `json:"phase"`
-	PhaseSeq      int                `json:"phase_seq"`
-	PhaseDeadline time.Time          `json:"phase_deadline,omitempty"`
-	RoundNumber   int                `json:"round_number"`
-	Prompt        *cards.PromptCard  `json:"prompt,omitempty"`
-	HostID        string             `json:"host_id,omitempty"`
-	JudgeID       string             `json:"judge_id,omitempty"`
-	JudgeIndex    int                `json:"judge_index"`
-	ScoreLimit    int                `json:"score_limit"`
-	SubmitSecs    int                `json:"submit_seconds"`
-	MaxPlayers    int                `json:"max_players"`
-	ContentTier   string             `json:"content_tier"`
-	Players       []PersistedPlayer  `json:"players"`
-	Order         []string           `json:"order"`
-	Submissions   []Submission       `json:"submissions"`
+	SchemaVersion int               `json:"schema_version"`
+	Revision      uint64            `json:"revision"`
+	InstanceID    string            `json:"-"`
+	Code          string            `json:"code"`
+	Phase         Phase             `json:"phase"`
+	PhaseSeq      int               `json:"phase_seq"`
+	PhaseDeadline time.Time         `json:"phase_deadline,omitempty"`
+	RoundNumber   int               `json:"round_number"`
+	Prompt        *cards.PromptCard `json:"prompt,omitempty"`
+	HostID        string            `json:"host_id,omitempty"`
+	JudgeID       string            `json:"judge_id,omitempty"`
+	JudgeIndex    int               `json:"judge_index"`
+	ScoreLimit    int               `json:"score_limit"`
+	SubmitSecs    int               `json:"submit_seconds"`
+	MaxPlayers    int               `json:"max_players"`
+	ContentTier   string            `json:"content_tier"`
+	Players       []PersistedPlayer `json:"players"`
+	Order         []string          `json:"order"`
+	Submissions   []Submission      `json:"submissions"`
 	// RevealOrder/RevealIndex are additive: state written before the staged
 	// reveal existed restores with an empty order, which the room rebuilds.
-	RevealOrder []string `json:"reveal_order,omitempty"`
-	RevealIndex int      `json:"reveal_index,omitempty"`
-	AnswerPile    []cards.AnswerCard `json:"answer_pile"`
-	PromptPile    []cards.PromptCard `json:"prompt_pile"`
-	CreatedAt     time.Time          `json:"created_at"`
-	UpdatedAt     time.Time          `json:"updated_at"`
+	RevealOrder []string           `json:"reveal_order,omitempty"`
+	RevealIndex int                `json:"reveal_index,omitempty"`
+	AnswerPile  []cards.AnswerCard `json:"answer_pile"`
+	PromptPile  []cards.PromptCard `json:"prompt_pile"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
 }
 
 // PersistedPlayer intentionally includes the guest token. It is only written
