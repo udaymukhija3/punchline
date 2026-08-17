@@ -11,6 +11,7 @@ type Phase string
 const (
 	PhaseLobby      Phase = "lobby"
 	PhaseSubmitting Phase = "submitting"
+	PhaseRevealing  Phase = "revealing"
 	PhaseJudging    Phase = "judging"
 	PhaseScoring    Phase = "scoring"
 	PhaseFinished   Phase = "finished"
@@ -35,6 +36,9 @@ type Submission struct {
 	Answer      cards.AnswerCard `json:"answer"`
 	SubmittedAt time.Time        `json:"submitted_at"`
 	IsWinner    bool             `json:"is_winner"`
+	// Revealed reports whether this card is face up yet. It is set on the
+	// snapshot copy only, never on the stored submission.
+	Revealed bool `json:"revealed,omitempty"`
 }
 
 type RoomSnapshot struct {
@@ -49,8 +53,11 @@ type RoomSnapshot struct {
 	MaxPlayers    int               `json:"max_players"`
 	ContentTier   string            `json:"content_tier"`
 	PhaseDeadline *time.Time        `json:"phase_deadline,omitempty"`
-	Players       []Player          `json:"players"`
-	Submissions   []Submission      `json:"submissions,omitempty"`
+	// RevealIndex is how many submissions are face up. During the reveal it
+	// climbs one card at a time; afterwards it covers the whole table.
+	RevealIndex int          `json:"reveal_index,omitempty"`
+	Players     []Player     `json:"players"`
+	Submissions []Submission `json:"submissions,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	UpdatedAt     time.Time         `json:"updated_at"`
 }

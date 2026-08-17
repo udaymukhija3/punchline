@@ -39,6 +39,16 @@ const (
 	computerDelayJitter = 900
 )
 
+// The reveal turns cards over one at a time so the whole room reacts to the
+// same answer at the same moment -- the beat a shared table gets for free and a
+// screen has to be given deliberately. A full table would outstay its welcome
+// at the leisurely per-card pace, so the beat compresses to fit a total budget.
+const (
+	revealStepInterval = 1400 * time.Millisecond
+	revealStepMin      = 600 * time.Millisecond
+	revealTotalBudget  = 9 * time.Second
+)
+
 var (
 	ErrRoomFull    = errors.New("room is full")
 	ErrInvalidName = errors.New("name contains unsupported characters")
@@ -71,7 +81,12 @@ type Room struct {
 	players       map[string]*Player
 	order         []string
 	submissions   map[string]Submission
-	answerPile    []cards.AnswerCard
+	// revealOrder fixes the order cards turn over in, shuffled once per round.
+	// It also drives snapshot ordering, so a card's position on the table never
+	// betrays how fast its author answered. revealIndex is how many are face up.
+	revealOrder []string
+	revealIndex int
+	answerPile  []cards.AnswerCard
 	promptPile    []cards.PromptCard
 	clients       map[string]map[*ws.Conn]bool
 	createdAt     time.Time
@@ -255,6 +270,15 @@ func RestoreRoom(state PersistedRoomState, deck cards.Deck) (*Room, error) {
 		}
 		r.submissions[submission.ID] = submission
 	}
+	// Drop reveal slots for submissions that did not survive, then rebuild the
+	// order outright if a room was persisted mid-reveal without one.
+	r.revealOrder = append([]string(nil), state.RevealOrder...)
+	r.revealIndex = state.RevealIndex
+	r.pruneRevealOrderLocked()
+	if r.phase == PhaseRevealing && len(r.revealOrder) == 0 && len(r.submissions) > 0 {
+		r.revealOrder = r.shuffledSubmissionIDsLocked()
+		r.revealIndex = 1
+	}
 	if len(r.answerPile) == 0 {
 		r.answerPile = r.deck.ShuffledAnswers()
 	}
@@ -382,6 +406,7 @@ func (r *Room) removePlayerLocked(playerID string) {
 			delete(r.submissions, id)
 		}
 	}
+	r.pruneRevealOrderLocked()
 	index := -1
 	for i, id := range r.order {
 		if id == playerID {
@@ -442,6 +467,7 @@ func (r *Room) applyRosterLossLocked(wasJudge bool) {
 			}
 		}
 		r.submissions = map[string]Submission{}
+		r.resetRevealLocked()
 		for _, id := range r.order {
 			r.players[id].IsJudge = false
 		}
@@ -453,12 +479,13 @@ func (r *Room) applyRosterLossLocked(wasJudge bool) {
 	case PhaseSubmitting:
 		// The room may have been waiting only on the player who just left.
 		if r.allAnswerersSubmitted() {
-			r.beginJudgingLocked()
+			r.beginRevealLocked()
 			r.scheduleComputerTurnsLocked()
 		}
-	case PhaseJudging:
+	case PhaseRevealing, PhaseJudging:
 		// Their card may have been the only thing left to judge.
 		if len(r.submissions) == 0 {
+			r.resetRevealLocked()
 			r.setPhaseLocked(PhaseScoring, 0)
 		}
 	}
@@ -656,7 +683,7 @@ func (r *Room) submitAnswerLocked(playerID, answerID string) error {
 	r.recordAnswerLocked(telemetry.MetricPlayed, answer)
 
 	if r.allAnswerersSubmitted() {
-		r.beginJudgingLocked()
+		r.beginRevealLocked()
 	}
 	return nil
 }
@@ -730,6 +757,7 @@ func (r *Room) SkipPrompt(playerID string) error {
 		}
 	}
 	r.submissions = map[string]Submission{}
+	r.resetRevealLocked()
 	r.recordPromptLocked(telemetry.MetricSkipped, r.prompt)
 	prompt := r.drawPrompt()
 	r.prompt = &prompt
@@ -756,6 +784,7 @@ func (r *Room) PlayAgain(playerID string) error {
 	r.judgeID = ""
 	r.prompt = nil
 	r.submissions = map[string]Submission{}
+	r.resetRevealLocked()
 	for _, p := range r.players {
 		p.Score = 0
 		p.IsJudge = false
@@ -844,6 +873,7 @@ func clampInt(v, lo, hi, fallback int) int {
 func (r *Room) beginRoundLocked() {
 	r.roundNumber++
 	r.submissions = map[string]Submission{}
+	r.resetRevealLocked()
 	prompt := r.drawPrompt()
 	r.prompt = &prompt
 	r.recordPromptLocked(telemetry.MetricPlayed, r.prompt)
@@ -857,15 +887,92 @@ func (r *Room) beginRoundLocked() {
 	r.touch()
 }
 
-func (r *Room) beginJudgingLocked() {
+// beginRevealLocked closes the answer phase and starts turning cards over. The
+// judge cannot pick until the last one lands, so everyone reads the table
+// together instead of watching the round resolve before they have caught up.
+func (r *Room) beginRevealLocked() {
 	if len(r.submissions) == 0 {
-		// Nobody submitted — skip judging and let the host move on.
+		// Nobody submitted — skip the reveal and let the host move on.
+		r.resetRevealLocked()
 		r.setPhaseLocked(PhaseScoring, 0)
 		r.touch()
 		return
 	}
-	r.setPhaseLocked(PhaseJudging, judgeDuration)
+	r.revealOrder = r.shuffledSubmissionIDsLocked()
+	r.revealIndex = 1 // the first card lands at once; the rest follow on the beat
+	r.setPhaseLocked(PhaseRevealing, revealStepFor(len(r.revealOrder)))
 	r.touch()
+}
+
+// advanceRevealLocked turns the next card face up, or hands the round to the
+// judge once the table is fully revealed. The final card gets its own beat
+// before the judge's controls appear.
+func (r *Room) advanceRevealLocked() {
+	if r.revealIndex >= len(r.revealOrder) {
+		r.setPhaseLocked(PhaseJudging, judgeDuration)
+		r.touch()
+		return
+	}
+	r.revealIndex++
+	r.setPhaseLocked(PhaseRevealing, revealStepFor(len(r.revealOrder)))
+	r.touch()
+}
+
+// revealStepFor keeps a three-player round unhurried while stopping a full
+// twelve-player table from spending a quarter minute flipping cards.
+func revealStepFor(n int) time.Duration {
+	if n <= 0 {
+		return revealStepInterval
+	}
+	step := revealStepInterval
+	if total := time.Duration(n) * step; total > revealTotalBudget {
+		step = revealTotalBudget / time.Duration(n)
+	}
+	if step < revealStepMin {
+		step = revealStepMin
+	}
+	return step
+}
+
+// shuffledSubmissionIDsLocked picks the reveal order. Sorting first keeps the
+// shuffle the only source of randomness rather than Go's map iteration.
+func (r *Room) shuffledSubmissionIDsLocked() []string {
+	ids := make([]string, 0, len(r.submissions))
+	for id := range r.submissions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for i := len(ids) - 1; i > 0; i-- {
+		j := randInt(i + 1)
+		ids[i], ids[j] = ids[j], ids[i]
+	}
+	return ids
+}
+
+func (r *Room) resetRevealLocked() {
+	r.revealOrder = nil
+	r.revealIndex = 0
+}
+
+// pruneRevealOrderLocked drops slots whose submission has gone (its author left
+// mid-reveal) while keeping the cards already face up face up.
+func (r *Room) pruneRevealOrderLocked() {
+	if len(r.revealOrder) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(r.revealOrder))
+	revealed := 0
+	for i, id := range r.revealOrder {
+		if _, ok := r.submissions[id]; !ok {
+			continue
+		}
+		if i < r.revealIndex {
+			revealed++
+		}
+		kept = append(kept, id)
+	}
+	r.revealOrder = kept
+	r.revealIndex = revealed
 }
 
 // awardLocked grants the point for a submission, then either finishes the
@@ -933,7 +1040,9 @@ func (r *Room) onDeadline(seq int) {
 	}
 	switch r.phase {
 	case PhaseSubmitting:
-		r.beginJudgingLocked()
+		r.beginRevealLocked()
+	case PhaseRevealing:
+		r.advanceRevealLocked()
 	case PhaseJudging:
 		// Judge ran out of time — pick a random submission so play continues.
 		r.awardLocked(r.randomSubmissionID())
@@ -1095,22 +1204,60 @@ func (r *Room) snapshotLocked(viewerID string) RoomSnapshot {
 		players = append(players, p)
 	}
 
+	// Once a reveal order exists it governs both what is face up and how the
+	// table is laid out, so nothing can be inferred from a card's position.
+	position := make(map[string]int, len(r.revealOrder))
+	for i, id := range r.revealOrder {
+		position[id] = i
+	}
+	faceUp := len(r.submissions)
+	switch r.phase {
+	case PhaseSubmitting:
+		faceUp = 0
+	case PhaseRevealing:
+		faceUp = r.revealIndex
+	}
+
 	submissions := make([]Submission, 0, len(r.submissions))
 	for _, s := range r.submissions {
 		redacted := s
-		if r.phase == PhaseSubmitting {
+		switch r.phase {
+		case PhaseSubmitting:
 			// Hide content and authorship until the reveal.
 			redacted.Answer = cards.AnswerCard{ID: s.ID, Text: "submitted"}
 			redacted.PlayerID = ""
 			redacted.PlayerName = ""
-		} else if r.phase == PhaseJudging {
+		case PhaseRevealing:
+			// Face down until this card's beat arrives; authorship stays blind
+			// through the whole reveal so the judge reads answers, not authors.
+			redacted.PlayerID = ""
+			redacted.PlayerName = ""
+			if idx, ok := position[s.ID]; ok && idx < faceUp {
+				redacted.Revealed = true
+			} else {
+				redacted.Answer = cards.AnswerCard{ID: s.ID, Text: "submitted"}
+			}
+		case PhaseJudging:
 			// Reveal cards but keep authorship blind for fair judging.
 			redacted.PlayerID = ""
 			redacted.PlayerName = ""
+			redacted.Revealed = true
+		default:
+			redacted.Revealed = true
 		}
 		submissions = append(submissions, redacted)
 	}
-	sort.Slice(submissions, func(i, j int) bool { return submissions[i].SubmittedAt.Before(submissions[j].SubmittedAt) })
+	sort.Slice(submissions, func(i, j int) bool {
+		pi, iOK := position[submissions[i].ID]
+		pj, jOK := position[submissions[j].ID]
+		if iOK && jOK {
+			return pi < pj
+		}
+		if iOK != jOK {
+			return iOK
+		}
+		return submissions[i].SubmittedAt.Before(submissions[j].SubmittedAt)
+	})
 
 	var deadline *time.Time
 	if !r.phaseDeadline.IsZero() {
@@ -1130,6 +1277,7 @@ func (r *Room) snapshotLocked(viewerID string) RoomSnapshot {
 		MaxPlayers:    r.maxPlayers,
 		ContentTier:   r.contentTier,
 		PhaseDeadline: deadline,
+		RevealIndex:   faceUp,
 		Players:       players,
 		Submissions:   submissions,
 		CreatedAt:     r.createdAt,
@@ -1220,6 +1368,8 @@ func (r *Room) persistedStateLocked() PersistedRoomState {
 		Players:       players,
 		Order:         append([]string(nil), r.order...),
 		Submissions:   sortedSubmissions(r.submissions),
+		RevealOrder:   append([]string(nil), r.revealOrder...),
+		RevealIndex:   r.revealIndex,
 		AnswerPile:    append([]cards.AnswerCard(nil), r.answerPile...),
 		PromptPile:    append([]cards.PromptCard(nil), r.promptPile...),
 		CreatedAt:     r.createdAt,
@@ -1237,7 +1387,7 @@ func (r *Room) touch() {
 
 func validPhase(phase Phase) bool {
 	switch phase {
-	case PhaseLobby, PhaseSubmitting, PhaseJudging, PhaseScoring, PhaseFinished:
+	case PhaseLobby, PhaseSubmitting, PhaseRevealing, PhaseJudging, PhaseScoring, PhaseFinished:
 		return true
 	default:
 		return false

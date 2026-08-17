@@ -45,6 +45,10 @@ type PersistedRoomState struct {
 	Players       []PersistedPlayer  `json:"players"`
 	Order         []string           `json:"order"`
 	Submissions   []Submission       `json:"submissions"`
+	// RevealOrder/RevealIndex are additive: state written before the staged
+	// reveal existed restores with an empty order, which the room rebuilds.
+	RevealOrder []string `json:"reveal_order,omitempty"`
+	RevealIndex int      `json:"reveal_index,omitempty"`
 	AnswerPile    []cards.AnswerCard `json:"answer_pile"`
 	PromptPile    []cards.PromptCard `json:"prompt_pile"`
 	CreatedAt     time.Time          `json:"created_at"`
@@ -130,6 +134,7 @@ func clonePersistedRoomState(state PersistedRoomState) PersistedRoomState {
 	}
 	cloned.Order = append([]string(nil), state.Order...)
 	cloned.Submissions = append([]Submission(nil), state.Submissions...)
+	cloned.RevealOrder = append([]string(nil), state.RevealOrder...)
 	cloned.AnswerPile = append([]cards.AnswerCard(nil), state.AnswerPile...)
 	cloned.PromptPile = append([]cards.PromptCard(nil), state.PromptPile...)
 	return cloned
