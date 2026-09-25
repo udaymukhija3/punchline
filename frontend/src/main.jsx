@@ -1004,7 +1004,7 @@ function DailyRoundView({ view, session, onChanged, setNotice }) {
       <div>
         <span className="eyebrow">{view.group.name}</span>
         <h1>Daily #{round.number}</h1>
-        <p className="muted">Playing as {view.membership.display_name} · {view.group.member_count} members</p>
+        <p className="muted">Playing as {view.membership.display_name} · {plural(view.group.member_count, 'member')}</p>
       </div>
       <div className="daily-streak"><b>{view.streak}</b><span>day streak</span></div>
     </section>
