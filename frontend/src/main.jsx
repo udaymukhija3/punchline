@@ -1157,7 +1157,8 @@ function ReportControl({ card, kind, roomCode, session }) {
         }),
       });
       if (!res.ok) throw new Error('report failed');
-      setState('done');
+      const result = await readPayload(res);
+      setState(result.already_reviewed ? 'reviewed' : 'done');
       setOpen(false);
     } catch {
       setState('failed');
@@ -1165,6 +1166,7 @@ function ReportControl({ card, kind, roomCode, session }) {
   }
 
   if (state === 'done') return <span className="report-done" role="status">Reported. Thanks.</span>;
+  if (state === 'reviewed') return <span className="report-done" role="status">Already reviewed. Thanks.</span>;
   return (
     <div className="report-control">
       <button className="inline-button subtle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>

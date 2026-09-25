@@ -176,6 +176,41 @@ func TestPostgresReportsAutoRetireThenRestore(t *testing.T) {
 	if err := s.ResolveReports(ctx, KindAnswer, cardID, "dismissed"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("resolving an already-clean card = %v", err)
 	}
+
+	// The three reporters the admin just overruled cannot retire the card again
+	// by re-filing, and are told their report was already reviewed rather than
+	// that it was recorded.
+	for _, reporter := range []string{"reporter-one", "reporter-two", "reporter-three"} {
+		again, err := s.Report(ctx, ReportInput{CardKind: KindAnswer, CardID: cardID, Reason: "unfunny"}, reporter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.Recorded || again.Retired || !again.AlreadyReviewed {
+			t.Fatalf("%s re-filing after dismissal = %+v, want already reviewed", reporter, again)
+		}
+	}
+	var reason string
+	if err := db.QueryRowContext(ctx, `SELECT status::text, (SELECT count(*) FROM card_reports WHERE answer_card_id = $1::uuid AND resolved_at IS NULL) FROM answer_cards WHERE id = $1::uuid`, cardID).Scan(&status, &open); err != nil {
+		t.Fatal(err)
+	}
+	if status != "approved" || open != 0 {
+		t.Fatalf("after re-filing: status = %q with %d open reports, want approved with 0", status, open)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT DISTINCT reason FROM card_reports WHERE answer_card_id = $1::uuid`, cardID).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "offensive" {
+		t.Fatalf("re-filing rewrote a reviewed report's reason to %q", reason)
+	}
+
+	// Someone new still gets heard.
+	fresh, err := s.Report(ctx, input, "reporter-four")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.Recorded || fresh.AlreadyReviewed {
+		t.Fatalf("a new reporter after dismissal = %+v, want recorded", fresh)
+	}
 }
 
 // Approving a candidate is the only path from player text to a real card.
