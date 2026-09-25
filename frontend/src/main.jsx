@@ -55,6 +55,7 @@ const PLAYER_COPY = {
   'could not create room': 'Could not create a room. Try again in a moment.',
   'too many requests': 'That was a lot of taps. Give it a minute.',
   'too many messages': 'That was a lot of taps. Give it a minute.',
+  'daily mode requires postgresql': 'Daily groups are not running on this server. The live game still works.',
 };
 
 function errorMessage(err, fallback) {
