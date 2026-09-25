@@ -55,6 +55,7 @@ const PLAYER_COPY = {
   'could not create room': 'Could not create a room. Try again in a moment.',
   'too many requests': 'That was a lot of taps. Give it a minute.',
   'too many messages': 'That was a lot of taps. Give it a minute.',
+  'daily mode requires postgresql': 'Daily groups are not running on this server. The live game still works.',
 };
 
 function errorMessage(err, fallback) {
@@ -1003,7 +1004,7 @@ function DailyRoundView({ view, session, onChanged, setNotice }) {
       <div>
         <span className="eyebrow">{view.group.name}</span>
         <h1>Daily #{round.number}</h1>
-        <p className="muted">Playing as {view.membership.display_name} · {view.group.member_count} members</p>
+        <p className="muted">Playing as {view.membership.display_name} · {plural(view.group.member_count, 'member')}</p>
       </div>
       <div className="daily-streak"><b>{view.streak}</b><span>day streak</span></div>
     </section>
@@ -1157,7 +1158,8 @@ function ReportControl({ card, kind, roomCode, session }) {
         }),
       });
       if (!res.ok) throw new Error('report failed');
-      setState('done');
+      const result = await readPayload(res);
+      setState(result.already_reviewed ? 'reviewed' : 'done');
       setOpen(false);
     } catch {
       setState('failed');
@@ -1165,6 +1167,7 @@ function ReportControl({ card, kind, roomCode, session }) {
   }
 
   if (state === 'done') return <span className="report-done" role="status">Reported. Thanks.</span>;
+  if (state === 'reviewed') return <span className="report-done" role="status">Already reviewed. Thanks.</span>;
   return (
     <div className="report-control">
       <button className="inline-button subtle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>

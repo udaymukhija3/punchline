@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -435,6 +437,35 @@ func TestDailyModeFailsClosedWithoutPostgres(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "requires PostgreSQL") {
 		t.Fatalf("unexpected response: %s", rec.Body.String())
+	}
+}
+
+// The SPA fallback exists for deep links. An /api path that matches nothing is
+// a client bug, and answering it with 200 and the app shell hides that bug.
+func TestUnknownAPIRouteIsNotTheAppShell(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(`<div id="root"></div>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STATIC_DIR", dir)
+	routes := NewHandler(realtime.NewRoomManager(cards.NewSeedDeck())).Routes()
+
+	for _, path := range []string{"/api/nope", "/api/cards/stats", "/api/cards/report/extra"} {
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want %d: %s", path, rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("GET %s content type = %q, want JSON", path, ct)
+		}
+	}
+
+	// Deep links still get the app.
+	rec := httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/daily", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="root"`) {
+		t.Fatalf("GET /daily = %d %q, want the app shell", rec.Code, rec.Body.String())
 	}
 }
 

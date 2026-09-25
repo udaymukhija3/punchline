@@ -65,7 +65,11 @@ func (h *Handler) cardReport(w http.ResponseWriter, r *http.Request) {
 		h.writeContentError(w, err)
 		return
 	}
-	h.metrics.recordContentAction("report", "ok")
+	if result.AlreadyReviewed {
+		h.metrics.recordContentAction("report", "already_reviewed")
+	} else {
+		h.metrics.recordContentAction("report", "ok")
+	}
 	if result.Retired {
 		h.metrics.recordCardAutoRetired()
 	}

@@ -39,10 +39,16 @@ try {
   const card = listed.data.cards?.[0];
   if (!card?.id) throw new Error('admin card browser returned nothing to report');
 
-  const reported = await request('/api/cards/report', {
-    method: 'POST',
-    body: { card_kind: 'answer', card_id: card.id, reason: 'broken', detail: 'deploy smoke', room_code: 'SMOKE1' },
-  });
+  // Report from a seat in a fresh room, the way a player does. A reporter gets
+  // one say per card, so reporting by address would make every rerun from the
+  // same machine a repeat of a report this script already dismissed.
+  const room = await request('/api/rooms', { method: 'POST' });
+  const seat = await request(`/api/rooms/${room.data.code}/join`, { method: 'POST', body: { name: 'Smoke' } });
+  const report = {
+    card_kind: 'answer', card_id: card.id, reason: 'broken', detail: 'deploy smoke',
+    room_code: room.data.code, player_id: seat.data.player.id, token: seat.data.token,
+  };
+  const reported = await request('/api/cards/report', { method: 'POST', body: report });
   if (!reported.data.recorded) throw new Error('report was not recorded');
 
   // Malformed reports must be rejected, not silently accepted.
@@ -65,6 +71,12 @@ try {
   const after = await request('/api/admin/cards?kind=answer&status=approved&limit=200', { token: adminToken });
   if (!(after.data.cards || []).some((item) => item.id === card.id)) {
     throw new Error('the dismissed card did not return to rotation');
+  }
+
+  // Re-filing after review must say so rather than claim it was recorded.
+  const refiled = await request('/api/cards/report', { method: 'POST', body: report });
+  if (refiled.data.recorded || !refiled.data.already_reviewed) {
+    throw new Error(`re-reporting a reviewed card answered ${JSON.stringify(refiled.data)}`);
   }
 
   const candidates = await request('/api/admin/candidates', { token: adminToken });

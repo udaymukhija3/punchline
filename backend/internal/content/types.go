@@ -41,6 +41,9 @@ type ReportInput struct {
 type ReportResult struct {
 	Recorded bool `json:"recorded"`
 	Retired  bool `json:"retired"`
+	// AlreadyReviewed means this reporter's earlier report on the card has
+	// been reviewed by an admin, so nothing new was filed.
+	AlreadyReviewed bool `json:"already_reviewed,omitempty"`
 }
 
 type Report struct {

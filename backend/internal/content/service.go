@@ -77,13 +77,27 @@ func (s *Service) Report(ctx context.Context, input ReportInput, reporterSeed st
 		return ReportResult{}, ErrNotFound
 	}
 
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+	// A reporter gets one say per card. Once an admin has reviewed their report,
+	// filing again changes nothing: dismissing a card three people pulled out of
+	// rotation puts it back, and letting those same three re-file would retire
+	// it again and quietly overrule the decision. The reviewed row is left as
+	// the admin saw it, and the caller is told so rather than "recorded".
+	inserted, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO card_reports (%s, reason, detail, reporter_hash, room_code)
 		VALUES ($1::uuid, $2, $3, $4, $5)
 		ON CONFLICT ((COALESCE(prompt_card_id, answer_card_id)), reporter_hash) DO UPDATE
-		SET reason = EXCLUDED.reason, detail = EXCLUDED.detail`, column),
-		input.CardID, input.Reason, detail, digest[:], roomCode); err != nil {
+		SET reason = EXCLUDED.reason, detail = EXCLUDED.detail
+		WHERE card_reports.resolved_at IS NULL`, column),
+		input.CardID, input.Reason, detail, digest[:], roomCode)
+	if err != nil {
 		return ReportResult{}, fmt.Errorf("insert card report: %w", err)
+	}
+	filed, err := inserted.RowsAffected()
+	if err != nil {
+		return ReportResult{}, fmt.Errorf("check card report: %w", err)
+	}
+	if filed == 0 {
+		return ReportResult{AlreadyReviewed: true}, nil
 	}
 
 	var openReports int

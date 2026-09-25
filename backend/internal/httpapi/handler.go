@@ -115,6 +115,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/api/admin/candidates", h.adminCandidates)
 	mux.HandleFunc("/api/admin/cards", h.adminCards)
 	mux.HandleFunc("/api/admin/daily-submissions/", h.adminDailySubmission)
+	// Anything else under /api is a client bug, not a deep link. Without this
+	// the SPA fallback answers it with 200 and index.html, which the client
+	// parses as an empty success.
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "not found")
+	})
 	mux.HandleFunc("/ws/rooms/", h.wsRoom)
 	if dir := staticDir(); dir != "" {
 		mux.Handle("/", spaHandler(dir))
