@@ -6,12 +6,25 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"punchline/backend/internal/cards"
 )
 
 func newTestRoom() *Room {
 	return NewRoom("TEST", cards.NewSeedDeck())
+}
+
+// completeReveal fast-forwards the staged reveal so tests about judging do not
+// have to sleep through the choreography. It mirrors what the deadline timer
+// does, including scheduling the computer turns that follow the transition.
+func completeReveal(r *Room) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.phase == PhaseRevealing {
+		r.advanceRevealLocked()
+	}
+	r.scheduleComputerTurnsLocked()
 }
 
 func TestJoinAssignsHostAndUniqueHand(t *testing.T) {
@@ -166,8 +179,12 @@ func TestStartComputerGameAddsComputerPlayersAndUsesRealLoop(t *testing.T) {
 		t.Fatalf("host submit failed: %v", err)
 	}
 	r.submitComputerAnswer(computerAnswererID, r.phaseSeq)
+	if r.phase != PhaseRevealing {
+		t.Fatalf("phase after computer submit = %q, want revealing", r.phase)
+	}
+	completeReveal(r)
 	if r.phase != PhaseJudging {
-		t.Fatalf("phase after computer submit = %q, want judging", r.phase)
+		t.Fatalf("phase after reveal = %q, want judging", r.phase)
 	}
 	r.pickComputerWinner(r.judgeID, r.phaseSeq)
 	if r.phase != PhaseScoring {
@@ -219,6 +236,7 @@ func playRound(t *testing.T, r *Room, ids []string) {
 			t.Fatalf("submit failed for %s: %v", id, err)
 		}
 	}
+	completeReveal(r)
 	if r.phase != PhaseJudging {
 		t.Fatalf("after all submissions phase = %q, want judging", r.phase)
 	}
@@ -290,8 +308,8 @@ func TestRoundWaitsForEveryAnswerer(t *testing.T) {
 			t.Fatalf("advanced after %d/3 submissions; a dropped submitter must not lower the bar", submitted)
 		}
 	}
-	if r.phase != PhaseJudging {
-		t.Fatalf("phase = %q after all answerers submitted, want judging", r.phase)
+	if r.phase != PhaseRevealing {
+		t.Fatalf("phase = %q after all answerers submitted, want revealing", r.phase)
 	}
 }
 
@@ -378,6 +396,7 @@ func TestJudgingSnapshotRevealsCardsButHidesAuthorsAndOtherHands(t *testing.T) {
 			t.Fatalf("submit failed: %v", err)
 		}
 	}
+	completeReveal(r)
 	if r.phase != PhaseJudging {
 		t.Fatalf("phase = %q, want judging", r.phase)
 	}
@@ -445,6 +464,7 @@ func TestJudgeOnlyPickWinnerAndHostOnlyRoundAdvance(t *testing.T) {
 			t.Fatalf("submit failed: %v", err)
 		}
 	}
+	completeReveal(r)
 	if r.phase != PhaseJudging {
 		t.Fatalf("phase = %q, want judging", r.phase)
 	}
@@ -784,7 +804,7 @@ func TestJudgeRotationSurvivesDepartures(t *testing.T) {
 		if snap.Phase == PhaseFinished {
 			break
 		}
-		if snap.Phase == PhaseSubmitting || snap.Phase == PhaseJudging {
+		if snap.Phase == PhaseSubmitting || snap.Phase == PhaseRevealing || snap.Phase == PhaseJudging {
 			judge := snap.JudgeID
 			if judge != "" && room.SnapshotFor(judge).JudgeID != judge {
 				t.Fatal("judge disagrees with itself between views")
@@ -805,5 +825,323 @@ func TestJudgeRotationSurvivesDepartures(t *testing.T) {
 		if err := room.NextRound(room.SnapshotFor("").HostID); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
+	}
+}
+
+// startRoundAndSubmitAll starts a game and has every answerer play a card,
+// returning the room, the judge, and the real text of each submitted card.
+func startRoundAndSubmitAll(t *testing.T, names ...string) (*Room, string, map[string]string) {
+	t.Helper()
+	r := newTestRoom()
+	host := r.Join(names[0])
+	for _, name := range names[1:] {
+		r.Join(name)
+	}
+	if err := r.StartGame(host.ID); err != nil {
+		t.Fatalf("start game: %v", err)
+	}
+	textByCard := map[string]string{}
+	for _, id := range r.order {
+		if id == r.judgeID {
+			continue
+		}
+		card := r.players[id].Hand[0]
+		textByCard[card.ID] = card.Text
+		if err := r.SubmitAnswer(id, card.ID); err != nil {
+			t.Fatalf("submit failed for %s: %v", id, err)
+		}
+	}
+	return r, r.judgeID, textByCard
+}
+
+func TestRevealTurnsCardsOverOneAtATime(t *testing.T) {
+	r, judge, textByCard := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+
+	if r.phase != PhaseRevealing {
+		t.Fatalf("phase after every answer = %q, want revealing", r.phase)
+	}
+	answerers := len(r.order) - 1
+
+	for step := 1; step <= answerers; step++ {
+		snap := r.SnapshotFor(judge)
+		if snap.RevealIndex != step {
+			t.Fatalf("step %d: reveal_index = %d, want %d", step, snap.RevealIndex, step)
+		}
+		faceUp := 0
+		for i, s := range snap.Submissions {
+			if !s.Revealed {
+				if s.Answer.Text != "submitted" {
+					t.Fatalf("step %d: face-down card %d leaked its text %q", step, i, s.Answer.Text)
+				}
+				continue
+			}
+			faceUp++
+			// A face-up card must carry its real text, and must come before
+			// every face-down one so the table fills in visual order.
+			if want := textByCard[s.Answer.ID]; want == "" || s.Answer.Text != want {
+				t.Fatalf("step %d: revealed card %d text = %q, want %q", step, i, s.Answer.Text, want)
+			}
+			if i >= step {
+				t.Fatalf("step %d: card at position %d is face up out of order", step, i)
+			}
+		}
+		if faceUp != step {
+			t.Fatalf("step %d: %d cards face up, want %d", step, faceUp, step)
+		}
+		if step < answerers {
+			r.mu.Lock()
+			r.advanceRevealLocked()
+			r.mu.Unlock()
+		}
+	}
+
+	// The last card gets its own beat before the judge's controls appear.
+	if r.phase != PhaseRevealing {
+		t.Fatalf("phase with the final card just turned = %q, want revealing", r.phase)
+	}
+	r.mu.Lock()
+	r.advanceRevealLocked()
+	r.mu.Unlock()
+	if r.phase != PhaseJudging {
+		t.Fatalf("phase after the last beat = %q, want judging", r.phase)
+	}
+}
+
+func TestRevealKeepsAuthorshipBlindThroughout(t *testing.T) {
+	r, judge, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+
+	for r.phase == PhaseRevealing {
+		for _, viewer := range append([]string{judge, ""}, r.order...) {
+			for _, s := range r.SnapshotFor(viewer).Submissions {
+				if s.PlayerID != "" || s.PlayerName != "" {
+					t.Fatalf("reveal snapshot for %q leaked authorship: %+v", viewer, s)
+				}
+			}
+		}
+		r.mu.Lock()
+		r.advanceRevealLocked()
+		r.mu.Unlock()
+	}
+}
+
+func TestJudgeCannotPickBeforeTheRevealFinishes(t *testing.T) {
+	r, judge, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+
+	var subID string
+	for id := range r.submissions {
+		subID = id
+		break
+	}
+	if err := r.PickWinner(judge, subID); err == nil {
+		t.Fatal("judge picked a winner while cards were still turning over")
+	}
+
+	completeReveal(r)
+	if err := r.PickWinner(judge, subID); err != nil {
+		t.Fatalf("judge pick after the reveal failed: %v", err)
+	}
+	if r.phase != PhaseScoring {
+		t.Fatalf("phase after the pick = %q, want scoring", r.phase)
+	}
+}
+
+// The table used to be laid out by submit time, so the first card revealed was
+// always the fastest answerer's -- authorship leaking through position.
+func TestRevealOrderDoesNotTrackSubmitOrder(t *testing.T) {
+	firstSeen := map[string]int{}
+	const trials = 60
+	for i := 0; i < trials; i++ {
+		r, judge, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+		snap := r.SnapshotFor(judge)
+		for _, s := range snap.Submissions {
+			if s.Revealed {
+				firstSeen[r.submissions[s.ID].PlayerName]++
+				break
+			}
+		}
+	}
+	if len(firstSeen) < 2 {
+		t.Fatalf("the same author was revealed first in all %d rounds: %v", trials, firstSeen)
+	}
+}
+
+func TestRevealCompressesForABigTable(t *testing.T) {
+	if got := revealStepFor(3); got != revealStepInterval {
+		t.Fatalf("small table step = %v, want %v", got, revealStepInterval)
+	}
+	big := revealStepFor(11)
+	if big >= revealStepInterval {
+		t.Fatalf("a full table should quicken the beat, got %v", big)
+	}
+	if total := 11 * big; total > revealTotalBudget {
+		t.Fatalf("full-table reveal runs %v, over the %v budget", total, revealTotalBudget)
+	}
+	if floor := revealStepFor(1000); floor < revealStepMin {
+		t.Fatalf("step %v fell below the %v floor", floor, revealStepMin)
+	}
+}
+
+func TestLeavingMidRevealDropsOnlyThatCard(t *testing.T) {
+	r, judge, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+
+	var leaver string
+	for _, id := range r.order {
+		if id != judge {
+			leaver = id
+			break
+		}
+	}
+	if err := r.Leave(leaver); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+
+	r.mu.Lock()
+	order := append([]string(nil), r.revealOrder...)
+	index := r.revealIndex
+	r.mu.Unlock()
+
+	if len(order) != len(r.submissions) {
+		t.Fatalf("reveal order has %d slots for %d submissions", len(order), len(r.submissions))
+	}
+	for _, id := range order {
+		if _, ok := r.submissions[id]; !ok {
+			t.Fatalf("reveal order kept a slot for the departed submission %q", id)
+		}
+	}
+	if index > len(order) {
+		t.Fatalf("reveal index %d exceeds the %d remaining cards", index, len(order))
+	}
+	if snap := r.SnapshotFor(judge); len(snap.Submissions) != len(order) {
+		t.Fatalf("snapshot showed %d cards, want %d", len(snap.Submissions), len(order))
+	}
+
+	completeReveal(r)
+	if r.phase != PhaseJudging {
+		t.Fatalf("phase after a mid-reveal departure = %q, want judging", r.phase)
+	}
+}
+
+func TestRevealSurvivesRestore(t *testing.T) {
+	r, judge, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+	r.mu.Lock()
+	r.advanceRevealLocked()
+	wantOrder := append([]string(nil), r.revealOrder...)
+	wantIndex := r.revealIndex
+	r.mu.Unlock()
+
+	restored, err := RestoreRoom(r.PersistedState(), cards.NewSeedDeck())
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.phase != PhaseRevealing {
+		t.Fatalf("restored phase = %q, want revealing", restored.phase)
+	}
+	if restored.revealIndex != wantIndex {
+		t.Fatalf("restored reveal index = %d, want %d", restored.revealIndex, wantIndex)
+	}
+	if strings.Join(restored.revealOrder, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("restored reveal order = %v, want %v", restored.revealOrder, wantOrder)
+	}
+	// The same cards must still be face up, and no more.
+	faceUp := 0
+	for _, s := range restored.SnapshotFor(judge).Submissions {
+		if s.Revealed {
+			faceUp++
+		}
+	}
+	if faceUp != wantIndex {
+		t.Fatalf("restored snapshot has %d cards face up, want %d", faceUp, wantIndex)
+	}
+}
+
+// A room persisted by an older build has no reveal order at all.
+func TestRestoreRebuildsAMissingRevealOrder(t *testing.T) {
+	r, _, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+	state := r.PersistedState()
+	state.RevealOrder = nil
+	state.RevealIndex = 0
+
+	restored, err := RestoreRoom(state, cards.NewSeedDeck())
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(restored.revealOrder) != len(restored.submissions) {
+		t.Fatalf("rebuilt order has %d slots for %d submissions", len(restored.revealOrder), len(restored.submissions))
+	}
+	if restored.revealIndex != 1 {
+		t.Fatalf("rebuilt reveal index = %d, want 1", restored.revealIndex)
+	}
+	completeReveal(restored)
+	if restored.phase != PhaseJudging {
+		t.Fatalf("phase after completing a rebuilt reveal = %q, want judging", restored.phase)
+	}
+}
+
+func TestScoringRevealsWinnerAndAuthorTogether(t *testing.T) {
+	r, judge, textByCard := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+	completeReveal(r)
+
+	var subID string
+	for id := range r.submissions {
+		subID = id
+		break
+	}
+	winnerName := r.submissions[subID].PlayerName
+	if err := r.PickWinner(judge, subID); err != nil {
+		t.Fatalf("pick winner: %v", err)
+	}
+
+	snap := r.SnapshotFor(judge)
+	winners := 0
+	for _, s := range snap.Submissions {
+		if !s.Revealed {
+			t.Fatalf("scoring left a card face down: %+v", s)
+		}
+		if s.Answer.Text != textByCard[s.Answer.ID] {
+			t.Fatalf("scoring card text = %q, want %q", s.Answer.Text, textByCard[s.Answer.ID])
+		}
+		// The payoff of blind judging is learning who played what.
+		if s.PlayerName == "" {
+			t.Fatalf("scoring withheld authorship: %+v", s)
+		}
+		if s.IsWinner {
+			winners++
+			if s.ID != subID || s.PlayerName != winnerName {
+				t.Fatalf("winner = %q by %q, want %q by %q", s.ID, s.PlayerName, subID, winnerName)
+			}
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("scoring marked %d winners, want 1", winners)
+	}
+}
+
+// Every other reveal test drives the steps by hand. This one leaves the room
+// alone and checks the deadline it armed, then that the timer behind it fires.
+func TestRevealAdvancesOnItsOwnTimer(t *testing.T) {
+	r, _, _ := startRoundAndSubmitAll(t, "Alice", "Bob", "Carol", "Dave")
+
+	r.mu.Lock()
+	step := revealStepFor(len(r.revealOrder))
+	armed := time.Until(r.phaseDeadline)
+	startIndex := r.revealIndex
+	r.mu.Unlock()
+
+	if armed > step || armed < step-250*time.Millisecond {
+		t.Fatalf("reveal armed %v ahead, want about %v", armed, step)
+	}
+
+	giveUp := time.Now().Add(step + 2*time.Second)
+	for {
+		r.mu.Lock()
+		index, phase := r.revealIndex, r.phase
+		r.mu.Unlock()
+		if index > startIndex || phase != PhaseRevealing {
+			return
+		}
+		if time.Now().After(giveUp) {
+			t.Fatal("the reveal never advanced on its own; the step timer is not wired up")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

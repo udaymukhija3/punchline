@@ -311,9 +311,48 @@ input, textarea { color: var(--text); }
 .prompt-card p { margin: 8px 0 0; }
 .prompt-label { display: block; color: var(--gold); font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; }
 .submissions { display: flex; flex-direction: column; gap: 10px; }
-.submission { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--cream); border: 1px solid rgba(25,21,18,.18); color: var(--ink); border-radius: 8px; padding: 14px 16px; font-size: 16px; font-weight: 750; }
+.submission { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--cream); border: 1px solid rgba(25,21,18,.18); color: var(--ink); border-radius: 8px; padding: 14px 16px; font-size: 16px; font-weight: 750; min-height: 52px; }
 .submission.winner { border-color: var(--good); box-shadow: 0 0 0 1px var(--good) inset; }
 .submission .by { color: var(--good); font-size: 13px; font-weight: 700; white-space: nowrap; }
+
+/* A card waiting its turn in the reveal. The stripes read as a card back, so
+   an unrevealed answer is obviously face down rather than blank or broken. */
+.submission.face-down {
+  background: repeating-linear-gradient(135deg, var(--surface-2) 0 10px, var(--surface) 10px 20px);
+  border-color: var(--line);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+}
+/* Fires once, when the server turns this card over. */
+.submission.revealed { animation: card-flip .34s cubic-bezier(.2,.7,.3,1) both; transform-origin: center left; }
+@keyframes card-flip {
+  from { transform: perspective(700px) rotateY(-78deg); opacity: 0; }
+  to   { transform: perspective(700px) rotateY(0deg); opacity: 1; }
+}
+.also-played { margin: 4px 0 0; text-transform: uppercase; letter-spacing: .1em; font-weight: 800; }
+
+/* The payoff: the winning line and who wrote it, together, after a round of
+   deliberately hiding exactly that. */
+.winner-spotlight {
+  background: linear-gradient(135deg, #1b2a1f, #14301f);
+  border: 1px solid var(--good);
+  border-radius: var(--radius);
+  padding: 22px 24px;
+  animation: spotlight-in .42s cubic-bezier(.2,.7,.3,1) both;
+}
+.winner-spotlight .eyebrow { color: var(--good); }
+.winner-answer { margin: 8px 0 0; font-size: clamp(20px, 3.2vw, 28px); line-height: 1.2; font-weight: 850; color: var(--text); }
+.winner-by { margin: 12px 0 0; color: var(--muted); font-weight: 700; }
+.winner-by b { color: var(--good); }
+@keyframes spotlight-in {
+  from { transform: translateY(10px) scale(.97); opacity: 0; }
+  to   { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .submission.revealed, .winner-spotlight { animation: none; }
+}
 
 .hand { display: flex; flex-direction: column; gap: 8px; }
 .answer-card {

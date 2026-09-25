@@ -314,6 +314,21 @@ function Landing({ onCreate, onJoin, onComputer, error, reconnecting, busyAction
   );
 }
 
+// A card stays face down until the reveal reaches it. The flip animation hangs
+// off the `revealed` class, so it fires exactly once — when the server turns
+// that card over — and not on unrelated re-renders.
+function submissionClass(submission, phase) {
+  const classes = ['submission'];
+  classes.push(phase !== 'submitting' && submission.revealed ? 'revealed' : 'face-down');
+  if (submission.is_winner && phase === 'scoring') classes.push('winner');
+  return classes.join(' ');
+}
+
+function cardFaceText(submission, phase) {
+  if (phase === 'submitting') return 'Card submitted';
+  return submission.revealed ? submission.answer?.text : '';
+}
+
 function useCountdown(deadline) {
   const [, tick] = useState(0);
   useEffect(() => {
@@ -345,6 +360,11 @@ function Game({ room, me, session, status, error, send, onLeave }) {
   const answerers = room.players.filter((p) => !p.is_judge);
   const submittedCount = answerers.filter((p) => p.submitted).length;
   const neededPlayers = Math.max(0, MIN_PLAYERS - room.players.length);
+  // The winning card gets its own spotlight at scoring, so the table below it
+  // lists everything else rather than repeating the winner.
+  const submissions = room.submissions || [];
+  const winner = room.phase === 'scoring' ? submissions.find((s) => s.is_winner) : null;
+  const others = winner ? submissions.filter((s) => s.id !== winner.id) : submissions;
   const shareLink = `${location.origin}/?join=${room.code}`;
   const [inviteNotice, setInviteNotice] = useState('');
   const inviteTimer = useRef(null);
@@ -459,7 +479,7 @@ function Game({ room, me, session, status, error, send, onLeave }) {
 
           {room.phase === 'finished' && <Finished room={room} isHost={isHost} send={send} />}
 
-          {(room.phase === 'submitting' || room.phase === 'judging' || room.phase === 'scoring') && (
+          {(room.phase === 'submitting' || room.phase === 'revealing' || room.phase === 'judging' || room.phase === 'scoring') && (
             <>
               <PhasePanel
                 room={room}
@@ -476,19 +496,28 @@ function Game({ room, me, session, status, error, send, onLeave }) {
                 <p>{room.prompt?.text}</p>
                 <ReportControl key={room.prompt?.uuid || room.prompt?.id} card={room.prompt} kind="prompt" roomCode={room.code} session={session} />
               </div>
+              {room.phase === 'scoring' && winner && (
+                <div className="winner-spotlight" aria-live="polite">
+                  <span className="eyebrow">Winner</span>
+                  <p className="winner-answer">{winner.answer?.text}</p>
+                  <p className="winner-by"><b>{winner.player_name}</b> takes the point</p>
+                  <ReportControl key={winner.answer?.uuid || winner.answer?.id} card={winner.answer} kind="answer" roomCode={room.code} session={session} />
+                </div>
+              )}
               <div className="submissions">
-                {(room.submissions || []).map((s) => (
-                  <div className={`submission ${s.is_winner ? 'winner' : ''}`} key={s.id}>
-                    <span>{room.phase === 'submitting' ? 'Card submitted' : s.answer?.text}</span>
+                {winner && others.length > 0 && <p className="muted small also-played">Also played</p>}
+                {others.map((s) => (
+                  <div className={submissionClass(s, room.phase)} key={s.id}>
+                    <span>{cardFaceText(s, room.phase)}</span>
                     {isJudge && room.phase === 'judging' && (
                       <button className="btn small" onClick={() => sendOnce('pick_winner', { submission_id: s.id })}>Pick</button>
                     )}
-                    {s.is_winner && s.player_name && <span className="by">{s.player_name} +1</span>}
-                    {room.phase !== 'submitting' && <ReportControl key={s.answer?.uuid || s.answer?.id} card={s.answer} kind="answer" roomCode={room.code} session={session} />}
+                    {room.phase === 'scoring' && s.player_name && <span className="by">{s.player_name}</span>}
+                    {s.revealed && <ReportControl key={s.answer?.uuid || s.answer?.id} card={s.answer} kind="answer" roomCode={room.code} session={session} />}
                   </div>
                 ))}
                 {room.phase === 'submitting' && (room.submissions || []).length === 0 && <p className="muted">No answers in yet...</p>}
-                {room.phase !== 'submitting' && (room.submissions || []).length === 0 && <p className="muted">Nobody answered in time. On to the next one.</p>}
+                {room.phase === 'scoring' && (room.submissions || []).length === 0 && <p className="muted">Nobody answered in time. On to the next one.</p>}
               </div>
               {room.phase === 'scoring' && isHost && (
                 <button className="btn primary block" onClick={() => send('next_round')}>Next round</button>
@@ -589,6 +618,15 @@ function PhasePanel({ room, isHost, isJudge, meP, judge, submittedCount, answere
       title = 'Choose your answer';
       body = `${judgeName} is judging. Pick one card before the timer runs out.`;
     }
+  }
+
+  if (room.phase === 'revealing') {
+    const total = (room.submissions || []).length;
+    const shown = room.reveal_index || 0;
+    title = 'Answers are coming up';
+    body = isJudge
+      ? `Card ${Math.min(shown, total)} of ${total}. You can pick once every answer is face up.`
+      : `Card ${Math.min(shown, total)} of ${total}. Everyone sees them at the same time.`;
   }
 
   if (room.phase === 'judging') {
@@ -724,7 +762,7 @@ function Finished({ room, isHost, send }) {
 }
 
 function phaseLabel(phase) {
-  return { lobby: 'Lobby', submitting: 'Answering', judging: 'Judging', scoring: 'Reveal', finished: 'Game over' }[phase] || phase;
+  return { lobby: 'Lobby', submitting: 'Answering', revealing: 'Reveal', judging: 'Judging', scoring: 'Winner', finished: 'Game over' }[phase] || phase;
 }
 
 const DAILY_SESSIONS_KEY = 'punchline.daily.sessions';
